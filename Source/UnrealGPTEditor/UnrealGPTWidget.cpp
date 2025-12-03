@@ -511,7 +511,7 @@ FLinearColor SUnrealGPTWidget::GetRoleColor(const FString& Role) const
 	}
 	else if (Role == TEXT("assistant"))
 	{
-		return FLinearColor(0.4f, 0.8f, 0.4f, 0.0f); // Green
+		return FLinearColor(0.4f, 0.8f, 0.4f, 1.0f); // Green
 	}
 	else if (Role == TEXT("system"))
 	{
