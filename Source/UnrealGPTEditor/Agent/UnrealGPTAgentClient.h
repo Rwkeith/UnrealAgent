@@ -119,45 +119,8 @@ private:
 	/** Process extracted tool calls: execute them and continue conversation */
 	void ProcessExtractedToolCalls(const TArray<FToolCallInfo>& ToolCalls, const FString& AccumulatedText);
 
-	/** Execute a tool call */
+	/** Execute a tool call (delegates to UUnrealGPTToolExecutor) */
 	FString ExecuteToolCall(const FString& ToolName, const FString& ArgumentsJson);
-
-	/** Execute Python code */
-	FString ExecutePythonCode(const FString& Code);
-
-	// /** Execute Computer Use action */
-	// FString ExecuteComputerUse(const FString& ActionJson);
-
-	// ==================== ATOMIC EDITOR TOOLS ====================
-	/** Get detailed actor info by label or name */
-	FString ExecuteGetActor(const FString& ArgumentsJson);
-
-	/** Set actor transform (location, rotation, scale) */
-	FString ExecuteSetActorTransform(const FString& ArgumentsJson);
-
-	/** Select actors by labels */
-	FString ExecuteSelectActors(const FString& ArgumentsJson);
-
-	/** Duplicate an actor with optional count and offset */
-	FString ExecuteDuplicateActor(const FString& ArgumentsJson);
-
-	/** Snap an actor to the ground below it */
-	FString ExecuteSnapActorToGround(const FString& ArgumentsJson);
-
-	/** Set rotation on multiple actors at once */
-	FString ExecuteSetActorsRotation(const FString& ArgumentsJson);
-
-	/** Helper: Find actor by label or name */
-	AActor* FindActorByLabelOrName(const FString& Label, const FString& Name);
-
-	/** Get viewport screenshot with optional focus actor and metadata output */
-	FString GetViewportScreenshot(const FString& ArgumentsJson, FString& OutMetadataJson);
-
-	/** Get scene summary */
-	FString GetSceneSummary(int32 PageSize = 100);
-
-	/** Focus viewport on the last created asset/actor */
-	void FocusViewportOnCreatedAsset(const FString& ResultJson);
 
 	/** Create HTTP request with proper headers */
 	TSharedRef<IHttpRequest> CreateHttpRequest();
