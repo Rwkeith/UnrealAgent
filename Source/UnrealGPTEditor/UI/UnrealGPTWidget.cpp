@@ -17,6 +17,7 @@
 #include "Misc/Base64.h"
 #include "UnrealGPTSceneContext.h"
 #include "UnrealGPTWidgetDelegateHandler.h"
+#include "UnrealGPTSessionManager.h"
 #include "Framework/Text/SlateTextRun.h"
 #include "Framework/Text/SlateTextLayout.h"
 #include "Widgets/Layout/SSpacer.h"
@@ -363,6 +364,43 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 								]
 							]
 						]
+
+						// Session History Dropdown
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.Padding(0.0f, 0.0f, 8.0f, 0.0f)
+						[
+							SNew(SBox)
+							.MinDesiredWidth(200.0f)
+							[
+								SAssignNew(SessionComboBox, SComboBox<TSharedPtr<FSessionInfo>>)
+								.OptionsSource(&SessionComboOptions)
+								.OnSelectionChanged(this, &SUnrealGPTWidget::OnSessionSelected)
+								.OnGenerateWidget(this, &SUnrealGPTWidget::GenerateSessionComboItem)
+								.Content()
+								[
+									SNew(SHorizontalBox)
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(8.0f, 4.0f, 6.0f, 4.0f)
+									[
+										SNew(STextBlock)
+										.Font(FAppStyle::Get().GetFontStyle("FontAwesome.11"))
+										.Text(FText::FromString(FString(TEXT("\xf017")))) // Clock/history icon
+										.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.8f))
+									]
+									+ SHorizontalBox::Slot()
+									.VAlign(VAlign_Center)
+									.Padding(0.0f, 4.0f, 8.0f, 4.0f)
+									[
+										SNew(STextBlock)
+										.Text(this, &SUnrealGPTWidget::GetCurrentSessionText)
+										.Font(FAppStyle::GetFontStyle("SmallFont"))
+									]
+								]
+							]
+						]
 					]
 
 					// Spacer
@@ -634,6 +672,9 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 			]
 		]
 	];
+
+	// Initialize session dropdown with available sessions
+	RefreshSessionDropdown();
 }
 
 FLinearColor SUnrealGPTWidget::GetRoleColor(const FString& Role) const
@@ -1111,11 +1152,137 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 		ToolColor = FLinearColor(0.3f, 0.8f, 0.6f, 1.0f);
 		ToolIcon = FString(TEXT("\xf030")); // Camera icon
 		ToolDisplayName = TEXT("Viewport Screenshot");
-		
-		ContentWidget = SNew(STextBlock)
-			.Text(NSLOCTEXT("UnrealGPT", "ScreenshotMsg", "Capturing current viewport state..."))
-			.Font(GetUnrealGPTSmallBodyItalicFont())
-			.ColorAndOpacity(FLinearColor(0.8f, 0.8f, 0.8f, 1.0f));
+
+		// Check if we have a result with an image to display
+		FString ImageBase64;
+		FString MetadataJson;
+		static const FString ImageSeparator = TEXT("\n__IMAGE_BASE64__\n");
+		int32 SeparatorIndex = Result.Find(ImageSeparator);
+		if (SeparatorIndex != INDEX_NONE)
+		{
+			MetadataJson = Result.Left(SeparatorIndex);
+			ImageBase64 = Result.Mid(SeparatorIndex + ImageSeparator.Len());
+		}
+
+		if (!ImageBase64.IsEmpty() &&
+			(ImageBase64.StartsWith(TEXT("iVBORw0KGgo")) || ImageBase64.StartsWith(TEXT("/9j/"))))
+		{
+			// We have a valid image - decode and display it inline
+			TArray<uint8> ImageData;
+			if (FBase64::Decode(ImageBase64, ImageData))
+			{
+				IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+				TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::JPEG);
+				if (!ImageWrapper->SetCompressed(ImageData.GetData(), ImageData.Num()))
+				{
+					ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+					ImageWrapper->SetCompressed(ImageData.GetData(), ImageData.Num());
+				}
+
+				if (ImageWrapper->GetWidth() > 0 && ImageWrapper->GetHeight() > 0)
+				{
+					TArray<uint8> UncompressedBGRA;
+					if (ImageWrapper->GetRaw(ERGBFormat::BGRA, 8, UncompressedBGRA))
+					{
+						const int32 Width = ImageWrapper->GetWidth();
+						const int32 Height = ImageWrapper->GetHeight();
+
+						TArray<FColor> Colors;
+						Colors.SetNum(Width * Height);
+						for (int32 i = 0; i < Width * Height; ++i)
+						{
+							Colors[i].B = UncompressedBGRA[i * 4 + 0];
+							Colors[i].G = UncompressedBGRA[i * 4 + 1];
+							Colors[i].R = UncompressedBGRA[i * 4 + 2];
+							Colors[i].A = UncompressedBGRA[i * 4 + 3];
+						}
+
+						FCreateTexture2DParameters Params;
+						Params.bDeferCompression = true;
+						Params.CompressionSettings = TC_Default;
+						UTexture2D* Texture = FImageUtils::CreateTexture2D(Width, Height, Colors, GetTransientPackage(), TEXT("ToolScreenshot"), RF_Transient, Params);
+						if (Texture)
+						{
+							Texture->AddToRoot();
+							ScreenshotTextures.Add(Texture);
+
+							TSharedPtr<FSlateBrush> Brush = MakeShared<FSlateBrush>();
+							Brush->SetResourceObject(Texture);
+							Brush->ImageSize = FVector2D(Width, Height);
+							ScreenshotBrushes.Add(Brush);
+
+							// Calculate display size (max 500x350 for inline display)
+							const float MaxDisplayWidth = 500.0f;
+							const float MaxDisplayHeight = 350.0f;
+							float DisplayWidth = static_cast<float>(Width);
+							float DisplayHeight = static_cast<float>(Height);
+
+							if (DisplayWidth > MaxDisplayWidth)
+							{
+								DisplayHeight *= MaxDisplayWidth / DisplayWidth;
+								DisplayWidth = MaxDisplayWidth;
+							}
+							if (DisplayHeight > MaxDisplayHeight)
+							{
+								DisplayWidth *= MaxDisplayHeight / DisplayHeight;
+								DisplayHeight = MaxDisplayHeight;
+							}
+
+							// Parse metadata for display info
+							FString CameraInfo;
+							TSharedPtr<FJsonObject> MetaObj;
+							TSharedRef<TJsonReader<>> MetaReader = TJsonReaderFactory<>::Create(MetadataJson);
+							if (FJsonSerializer::Deserialize(MetaReader, MetaObj) && MetaObj.IsValid())
+							{
+								const TSharedPtr<FJsonObject>* ResolutionObj = nullptr;
+								if (MetaObj->TryGetObjectField(TEXT("resolution"), ResolutionObj) && ResolutionObj)
+								{
+									int32 ResW = 0, ResH = 0;
+									(*ResolutionObj)->TryGetNumberField(TEXT("width"), ResW);
+									(*ResolutionObj)->TryGetNumberField(TEXT("height"), ResH);
+									CameraInfo = FString::Printf(TEXT("Resolution: %dx%d"), ResW, ResH);
+								}
+							}
+
+							ContentWidget = SNew(SVerticalBox)
+								+ SVerticalBox::Slot()
+								.AutoHeight()
+								[
+									SNew(SBox)
+									.WidthOverride(DisplayWidth)
+									.HeightOverride(DisplayHeight)
+									[
+										SNew(SImage)
+										.Image(Brush.Get())
+									]
+								]
+								+ SVerticalBox::Slot()
+								.AutoHeight()
+								.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+								[
+									SNew(STextBlock)
+									.Text(FText::FromString(CameraInfo))
+									.Font(GetUnrealGPTSmallBodyFont())
+									.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f, 1.0f))
+								];
+
+							// Mark that we handled the result so it doesn't get shown again
+							// We do this by setting a flag that the result display code will check
+							// Actually, we need to skip the result section for viewport_screenshot
+						}
+					}
+				}
+			}
+		}
+
+		// Fallback if we couldn't decode the image or there's no result yet
+		if (!ContentWidget.IsValid())
+		{
+			ContentWidget = SNew(STextBlock)
+				.Text(NSLOCTEXT("UnrealGPT", "ScreenshotMsg", "Capturing current viewport state..."))
+				.Font(GetUnrealGPTSmallBodyItalicFont())
+				.ColorAndOpacity(FLinearColor(0.8f, 0.8f, 0.8f, 1.0f));
+		}
 	}
 	// else if (ToolName == TEXT("computer_use"))
 	// {
@@ -1316,72 +1483,160 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 			];
 	}
 	
+	// Build result widget if result is provided and non-trivial
+	// Skip for viewport_screenshot since the image is displayed inline in ContentWidget
+	TSharedPtr<SWidget> ResultWidget;
+	const FString TrimmedResult = Result.TrimStartAndEnd();
+	const bool bSkipResultDisplay = (ToolName == TEXT("viewport_screenshot"));
+	if (!bSkipResultDisplay && !TrimmedResult.IsEmpty() && TrimmedResult != TEXT("[]") && TrimmedResult != TEXT("{}"))
+	{
+		// Parse and format the result for display
+		FString DisplayResult = TrimmedResult;
+
+		// Try to parse as JSON and extract status/message for cleaner display
+		if (TrimmedResult.StartsWith(TEXT("{")))
+		{
+			TSharedPtr<FJsonObject> ResultObj;
+			TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(TrimmedResult);
+			if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+			{
+				FString Status, Message;
+				ResultObj->TryGetStringField(TEXT("status"), Status);
+				ResultObj->TryGetStringField(TEXT("message"), Message);
+
+				if (!Status.IsEmpty() || !Message.IsEmpty())
+				{
+					DisplayResult = FString::Printf(TEXT("Status: %s"), *Status);
+					if (!Message.IsEmpty())
+					{
+						DisplayResult += FString::Printf(TEXT("\n%s"), *Message);
+					}
+				}
+			}
+		}
+		// For JSON arrays (scene_query results), show item count
+		else if (TrimmedResult.StartsWith(TEXT("[")))
+		{
+			TArray<TSharedPtr<FJsonValue>> JsonArray;
+			TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(TrimmedResult);
+			if (FJsonSerializer::Deserialize(ResultReader, JsonArray))
+			{
+				DisplayResult = FString::Printf(TEXT("Found %d item(s)"), JsonArray.Num());
+			}
+		}
+
+		// Truncate very long results
+		if (DisplayResult.Len() > 500)
+		{
+			DisplayResult = DisplayResult.Left(500) + TEXT("...");
+		}
+
+		ResultWidget = SNew(SVerticalBox)
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			[
+				SNew(STextBlock)
+				.Text(NSLOCTEXT("UnrealGPT", "ToolResult", "Result:"))
+				.Font(GetUnrealGPTSmallBodyFont())
+				.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 0.5f, 1.0f))
+			]
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+			[
+				SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+				.Padding(FMargin(8.0f))
+				.BorderBackgroundColor(FLinearColor(0.02f, 0.04f, 0.02f, 1.0f))
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(DisplayResult))
+					.Font(FCoreStyle::GetDefaultFontStyle("Mono", 8))
+					.ColorAndOpacity(FLinearColor(0.7f, 0.9f, 0.7f, 1.0f))
+					.AutoWrapText(true)
+				]
+			];
+	}
+
+	TSharedRef<SVerticalBox> MainVerticalBox = SNew(SVerticalBox)
+
+		// Tool header with icon
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0.0f, 0.0f, 0.0f, 8.0f)
+		[
+			SNew(SHorizontalBox)
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(0.0f, 0.0f, 10.0f, 0.0f)
+			[
+				SNew(SBox)
+				.WidthOverride(32.0f)
+				.HeightOverride(32.0f)
+				[
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("Brushes.White"))
+					.BorderBackgroundColor(ToolColor)
+					.Padding(0.0f)
+					.HAlign(HAlign_Center)
+					.VAlign(VAlign_Center)
+					[
+						SNew(STextBlock)
+						.Font(FAppStyle::Get().GetFontStyle("FontAwesome.14"))
+						.Text(FText::FromString(ToolIcon))
+						.ColorAndOpacity(FLinearColor::White)
+					]
+				]
+			]
+
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(ToolDisplayName))
+				.Font(GetUnrealGPTBodyBoldFont())
+				.ColorAndOpacity(ToolColor)
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(NSLOCTEXT("UnrealGPT", "ToolExecuted", "Executed"))
+				.Font(FAppStyle::GetFontStyle("SmallFont"))
+				.ColorAndOpacity(FLinearColor(0.5f, 0.5f, 0.5f, 1.0f))
+			]
+		]
+
+		// Content Section (Arguments)
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(42.0f, 0.0f, 0.0f, 8.0f)
+		[
+			ContentWidget.ToSharedRef()
+		];
+
+	// Add result section if we have one
+	if (ResultWidget.IsValid())
+	{
+		MainVerticalBox->AddSlot()
+			.AutoHeight()
+			.Padding(42.0f, 0.0f, 0.0f, 0.0f)
+			[
+				ResultWidget.ToSharedRef()
+			];
+	}
+
 	return SNew(SBorder)
 		.BorderImage(FAppStyle::GetBrush("Brushes.White"))
 		.BorderBackgroundColor(FLinearColor(0.04f, 0.04f, 0.04f, 1.0f))
 		.Padding(FMargin(12.0f, 10.0f))
 		[
-			SNew(SVerticalBox)
-			
-			// Tool header with icon
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(0.0f, 0.0f, 0.0f, 8.0f)
-			[
-				SNew(SHorizontalBox)
-				
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.VAlign(VAlign_Center)
-				.Padding(0.0f, 0.0f, 10.0f, 0.0f)
-				[
-					SNew(SBox)
-					.WidthOverride(32.0f)
-					.HeightOverride(32.0f)
-					[
-						SNew(SBorder)
-						.BorderImage(FAppStyle::GetBrush("Brushes.White"))
-						.BorderBackgroundColor(ToolColor)
-						.Padding(0.0f)
-						.HAlign(HAlign_Center)
-						.VAlign(VAlign_Center)
-						[
-							SNew(STextBlock)
-							.Font(FAppStyle::Get().GetFontStyle("FontAwesome.14"))
-							.Text(FText::FromString(ToolIcon))
-							.ColorAndOpacity(FLinearColor::White)
-						]
-					]
-				]
-				
-				+ SHorizontalBox::Slot()
-				.FillWidth(1.0f)
-				.VAlign(VAlign_Center)
-				[
-					SNew(STextBlock)
-					.Text(FText::FromString(ToolDisplayName))
-					.Font(GetUnrealGPTBodyBoldFont())
-					.ColorAndOpacity(ToolColor)
-				]
-				
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.VAlign(VAlign_Center)
-				[
-					SNew(STextBlock)
-					.Text(NSLOCTEXT("UnrealGPT", "ToolExecuted", "Executed"))
-					.Font(FAppStyle::GetFontStyle("SmallFont"))
-					.ColorAndOpacity(FLinearColor(0.5f, 0.5f, 0.5f, 1.0f))
-				]
-			]
-			
-			// Content Section
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(42.0f, 0.0f, 0.0f, 8.0f)
-			[
-				ContentWidget.ToSharedRef()
-			]
+			MainVerticalBox
 		];
 }
 
@@ -1563,6 +1818,10 @@ FReply SUnrealGPTWidget::OnNewConversationClicked()
 	{
 		ReasoningSummaryText->SetText(FText::GetEmpty());
 	}
+
+	// Clear current session selection and refresh dropdown
+	CurrentSelectedSession.Reset();
+	RefreshSessionDropdown();
 
 	return FReply::Handled();
 }
@@ -2256,5 +2515,346 @@ void SUnrealGPTWidget::OnRecordingStopped()
 	{
 		VoiceInputButton->Invalidate(EInvalidateWidget::LayoutAndVolatility);
 	}
+}
+
+// ==================== SESSION MANAGEMENT ====================
+
+void SUnrealGPTWidget::RefreshSessionDropdown()
+{
+	SessionComboOptions.Empty();
+
+	if (!IsValid(AgentClient))
+	{
+		return;
+	}
+
+	TArray<FSessionInfo> Sessions = AgentClient->GetSessionList();
+
+	for (const FSessionInfo& Info : Sessions)
+	{
+		SessionComboOptions.Add(MakeShared<FSessionInfo>(Info));
+	}
+
+	// Update combo box
+	if (SessionComboBox.IsValid())
+	{
+		SessionComboBox->RefreshOptions();
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Refreshed session dropdown with %d sessions"), SessionComboOptions.Num());
+}
+
+void SUnrealGPTWidget::OnSessionSelected(TSharedPtr<FSessionInfo> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: OnSessionSelected called - SelectInfo: %d, NewSelection valid: %d"),
+		static_cast<int32>(SelectInfo), NewSelection.IsValid() ? 1 : 0);
+
+	if (!NewSelection.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: OnSessionSelected - NewSelection is invalid"));
+		return;
+	}
+
+	// Skip programmatic selections (Direct) to avoid loops when refreshing
+	if (SelectInfo == ESelectInfo::Direct)
+	{
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: OnSessionSelected - Skipping Direct selection"));
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: OnSessionSelected - Session: %s, Title: %s"),
+		*NewSelection->SessionId, *NewSelection->Title);
+
+	// Don't reload if selecting current session
+	if (CurrentSelectedSession.IsValid() &&
+		CurrentSelectedSession->SessionId == NewSelection->SessionId)
+	{
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: OnSessionSelected - Same session already selected, skipping"));
+		return;
+	}
+
+	CurrentSelectedSession = NewSelection;
+
+	// Load the selected session
+	if (IsValid(AgentClient))
+	{
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Attempting to load session: %s"), *NewSelection->SessionId);
+		if (AgentClient->LoadConversation(NewSelection->SessionId))
+		{
+			// Rebuild UI from loaded session
+			RebuildChatHistoryFromSession();
+			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Successfully loaded and rebuilt session: %s"), *NewSelection->SessionId);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Failed to load session: %s"), *NewSelection->SessionId);
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("UnrealGPT: AgentClient is not valid"));
+	}
+}
+
+TSharedRef<SWidget> SUnrealGPTWidget::GenerateSessionComboItem(TSharedPtr<FSessionInfo> InItem)
+{
+	if (!InItem.IsValid())
+	{
+		return SNullWidget::NullWidget;
+	}
+
+	// Format: "Title (Jan 2, 14:30)"
+	FString DisplayTime = InItem->LastModifiedAt.ToString(TEXT("%b %d, %H:%M"));
+	FString TruncatedTitle = InItem->Title.Left(30);
+	if (InItem->Title.Len() > 30)
+	{
+		TruncatedTitle += TEXT("...");
+	}
+
+	return SNew(SBox)
+		.Padding(FMargin(8.0f, 4.0f))
+		[
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(TruncatedTitle))
+				.Font(FAppStyle::GetFontStyle("SmallFont"))
+			]
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(DisplayTime))
+				.Font(FAppStyle::GetFontStyle("TinyFont"))
+				.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f))
+			]
+		];
+}
+
+FText SUnrealGPTWidget::GetCurrentSessionText() const
+{
+	if (CurrentSelectedSession.IsValid())
+	{
+		FString TruncatedTitle = CurrentSelectedSession->Title.Left(20);
+		if (CurrentSelectedSession->Title.Len() > 20)
+		{
+			TruncatedTitle += TEXT("...");
+		}
+		return FText::FromString(TruncatedTitle);
+	}
+	return NSLOCTEXT("UnrealGPT", "SessionHistory", "Session History");
+}
+
+void SUnrealGPTWidget::RebuildChatHistoryFromSession()
+{
+	if (!ChatHistoryBox.IsValid() || !IsValid(AgentClient))
+	{
+		return;
+	}
+
+	UUnrealGPTSessionManager* SessionManager = AgentClient->GetSessionManager();
+	if (!SessionManager)
+	{
+		return;
+	}
+
+	// Clear existing UI
+	ChatHistoryBox->ClearChildren();
+
+	// Clean up old textures
+	for (UTexture2D* Texture : ScreenshotTextures)
+	{
+		if (IsValid(Texture) && Texture->IsRooted())
+		{
+			Texture->RemoveFromRoot();
+		}
+	}
+	ScreenshotTextures.Empty();
+	ScreenshotBrushes.Empty();
+	ToolCallHistory.Empty();
+	PendingAttachedImages.Empty();
+
+	// Hide reasoning status
+	if (ReasoningStatusBorder.IsValid())
+	{
+		ReasoningStatusBorder->SetVisibility(EVisibility::Collapsed);
+	}
+
+	const FSessionData& Session = SessionManager->GetCurrentSessionData();
+	int32 ToolCallIndex = 0;
+
+	for (const FPersistedMessage& Msg : Session.Messages)
+	{
+		if (Msg.Role == TEXT("user"))
+		{
+			// Add user message widget
+			FString DisplayContent = Msg.Content;
+			if (DisplayContent.IsEmpty() && Msg.ImageBase64.Num() > 0)
+			{
+				DisplayContent = TEXT("[Image attached]");
+			}
+
+			ChatHistoryBox->AddSlot()
+				.Padding(5.0f)
+				[
+					CreateMessageWidget(TEXT("user"), DisplayContent)
+				];
+
+			// Display attached images if any
+			for (const FString& ImageBase64 : Msg.ImageBase64)
+			{
+				DisplayImageFromBase64(ImageBase64);
+			}
+		}
+		else if (Msg.Role == TEXT("assistant"))
+		{
+			// Add assistant message
+			if (!Msg.Content.IsEmpty())
+			{
+				ChatHistoryBox->AddSlot()
+					.Padding(5.0f)
+					[
+						CreateMessageWidget(TEXT("assistant"), Msg.Content)
+					];
+			}
+
+			// Add tool call widgets for this message
+			while (ToolCallIndex < Session.ToolCalls.Num())
+			{
+				const FPersistedToolCall& TC = Session.ToolCalls[ToolCallIndex];
+				// Check if this tool call belongs to this message by timestamp
+				if (TC.Timestamp > Msg.Timestamp)
+				{
+					break;
+				}
+
+				ChatHistoryBox->AddSlot()
+					.Padding(12.0f, 6.0f)
+					[
+						CreateToolSpecificWidget(TC.ToolName, TC.Arguments, TC.Result)
+					];
+				ToolCallIndex++;
+			}
+		}
+		else if (Msg.Role == TEXT("tool"))
+		{
+			// Tool results with images - skip display here since viewport_screenshot
+			// images are now rendered inline within the tool call widget.
+			// Other tool images (if any in the future) could be handled here.
+			// For now, we don't display tool message images separately to avoid duplicates.
+		}
+	}
+
+	// Scroll to bottom
+	ChatHistoryBox->ScrollToEnd();
+
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Rebuilt chat UI with %d messages"), Session.Messages.Num());
+}
+
+void SUnrealGPTWidget::DisplayImageFromBase64(const FString& ImageBase64)
+{
+	if (ImageBase64.IsEmpty() || !ChatHistoryBox.IsValid())
+	{
+		return;
+	}
+
+	// Decode base64 to binary
+	TArray<uint8> ImageData;
+	if (!FBase64::Decode(ImageBase64, ImageData))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Failed to decode base64 image"));
+		return;
+	}
+
+	// Load image wrapper module
+	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+
+	// Try JPEG first, then PNG
+	TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::JPEG);
+	if (!ImageWrapper->SetCompressed(ImageData.GetData(), ImageData.Num()))
+	{
+		ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+		if (!ImageWrapper->SetCompressed(ImageData.GetData(), ImageData.Num()))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Failed to decompress image (not JPEG or PNG)"));
+			return;
+		}
+	}
+
+	// Get raw pixel data
+	TArray<uint8> UncompressedBGRA;
+	if (!ImageWrapper->GetRaw(ERGBFormat::BGRA, 8, UncompressedBGRA))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Failed to get raw image data"));
+		return;
+	}
+
+	const int32 Width = ImageWrapper->GetWidth();
+	const int32 Height = ImageWrapper->GetHeight();
+
+	// Convert BGRA to FColor array
+	TArray<FColor> Colors;
+	Colors.SetNum(Width * Height);
+	for (int32 i = 0; i < Width * Height; ++i)
+	{
+		Colors[i].B = UncompressedBGRA[i * 4 + 0];
+		Colors[i].G = UncompressedBGRA[i * 4 + 1];
+		Colors[i].R = UncompressedBGRA[i * 4 + 2];
+		Colors[i].A = UncompressedBGRA[i * 4 + 3];
+	}
+
+	// Create texture
+	FCreateTexture2DParameters Params;
+	Params.bDeferCompression = true;
+	Params.CompressionSettings = TC_Default;
+	UTexture2D* Texture = FImageUtils::CreateTexture2D(Width, Height, Colors, GetTransientPackage(), TEXT("SessionImage"), RF_Transient, Params);
+	if (!Texture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Failed to create texture from image"));
+		return;
+	}
+
+	Texture->AddToRoot();
+	ScreenshotTextures.Add(Texture);
+
+	// Create brush
+	TSharedPtr<FSlateBrush> Brush = MakeShared<FSlateBrush>();
+	Brush->SetResourceObject(Texture);
+	Brush->ImageSize = FVector2D(Width, Height);
+	ScreenshotBrushes.Add(Brush);
+
+	// Calculate display size (max 600x400 in chat)
+	const float MaxDisplayWidth = 600.0f;
+	const float MaxDisplayHeight = 400.0f;
+	float DisplayWidth = static_cast<float>(Width);
+	float DisplayHeight = static_cast<float>(Height);
+
+	if (DisplayWidth > MaxDisplayWidth)
+	{
+		const float Scale = MaxDisplayWidth / DisplayWidth;
+		DisplayWidth = MaxDisplayWidth;
+		DisplayHeight *= Scale;
+	}
+	if (DisplayHeight > MaxDisplayHeight)
+	{
+		const float Scale = MaxDisplayHeight / DisplayHeight;
+		DisplayHeight = MaxDisplayHeight;
+		DisplayWidth *= Scale;
+	}
+
+	// Add image to chat
+	ChatHistoryBox->AddSlot()
+		.Padding(12.0f, 6.0f)
+		[
+			SNew(SBox)
+			.WidthOverride(DisplayWidth)
+			.HeightOverride(DisplayHeight)
+			[
+				SNew(SImage)
+				.Image(Brush.Get())
+			]
+		];
 }
 

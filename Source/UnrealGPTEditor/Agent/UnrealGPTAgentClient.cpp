@@ -4,6 +4,7 @@
 #include "UnrealGPTReplicateClient.h"
 #include "UnrealGPTToolSchemas.h"
 #include "UnrealGPTToolExecutor.h"
+#include "UnrealGPTSessionManager.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -369,11 +370,26 @@ void UUnrealGPTAgentClient::Initialize()
 		Settings = GetMutableDefault<UUnrealGPTSettings>();
 	}
 
+	// Initialize session manager for conversation persistence
+	if (!SessionManager)
+	{
+		SessionManager = NewObject<UUnrealGPTSessionManager>();
+		SessionManager->AddToRoot();
+		SessionManager->Initialize();
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: SessionManager initialized"));
+	}
+
 	// Initialize conversation session ID for logging
 	if (ConversationSessionId.IsEmpty())
 	{
 		ConversationSessionId = GenerateSessionId();
 		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Initialized conversation session: %s"), *ConversationSessionId);
+
+		// Begin auto-save for the initial session
+		if (SessionManager)
+		{
+			SessionManager->BeginAutoSave(ConversationSessionId);
+		}
 	}
 }
 
@@ -502,6 +518,9 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 		UserMsg.Content = ProcessedMessage;
 		ConversationHistory.Add(UserMsg);
 		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added user message to history: %s"), *ProcessedMessage.Left(100));
+
+		// Save to session for persistence
+		SaveUserMessageToSession(ProcessedMessage, ImageBase64);
 	}
 	else
 	{
@@ -1135,6 +1154,13 @@ FString UUnrealGPTAgentClient::GenerateSessionId()
 
 void UUnrealGPTAgentClient::StartNewConversation()
 {
+	// Save current session before starting new one
+	if (SessionManager && !ConversationSessionId.IsEmpty())
+	{
+		SessionManager->SaveCurrentSession();
+		SessionManager->EndAutoSave();
+	}
+
 	// Generate a new session ID for the new conversation log file
 	ConversationSessionId = GenerateSessionId();
 
@@ -1142,6 +1168,13 @@ void UUnrealGPTAgentClient::StartNewConversation()
 
 	// Clear the conversation history (same as ClearHistory)
 	ClearHistory();
+
+	// Begin auto-save for the new session
+	if (SessionManager)
+	{
+		SessionManager->BeginAutoSave(ConversationSessionId);
+		SessionManager->RefreshSessionList();
+	}
 }
 
 TArray<TSharedPtr<FJsonObject>> UUnrealGPTAgentClient::BuildToolDefinitions()
@@ -2096,6 +2129,9 @@ void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo
 	AssistantMsg.ToolCallsJson = ToolCallsJsonString;
 	ConversationHistory.Add(AssistantMsg);
 
+	// Save assistant message to session for persistence
+	SaveAssistantMessageToSession(AccumulatedText, AssistantMsg.ToolCallIds, ToolCallsJsonString);
+
 	// Broadcast to UI
 	if (!AccumulatedText.IsEmpty())
 	{
@@ -2148,13 +2184,18 @@ void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo
 						TEXT(" characters.]");
 				}
 
-				AsyncTask(ENamedThreads::GameThread, [this, CallIdCopy, ToolResult, ToolResultForHistory]()
+				AsyncTask(ENamedThreads::GameThread, [this, ToolNameCopy, ArgsCopy, CallIdCopy, ToolResult, ToolResultForHistory]()
 				{
 					FAgentMessage ToolMsg;
 					ToolMsg.Role = TEXT("tool");
 					ToolMsg.ToolCallId = CallIdCopy;
 					ToolMsg.Content = ToolResultForHistory;
 					ConversationHistory.Add(ToolMsg);
+
+					// Save tool message and tool call to session for persistence
+					TArray<FString> ToolImages = ExtractImagesFromToolResult(ToolResult);
+					SaveToolMessageToSession(CallIdCopy, ToolResultForHistory, ToolImages);
+					SaveToolCallToSession(ToolNameCopy, ArgsCopy, ToolResult);
 
 					OnToolResult.Broadcast(CallIdCopy, ToolResult);
 					SendMessage(TEXT(""), TArray<FString>());
@@ -2199,6 +2240,11 @@ void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo
 		ToolMsg.ToolCallId = CallInfo.Id;
 		ToolMsg.Content = ToolResultForHistory;
 		ConversationHistory.Add(ToolMsg);
+
+		// Save tool message and tool call to session for persistence
+		TArray<FString> ToolImages = ExtractImagesFromToolResult(ToolResult);
+		SaveToolMessageToSession(CallInfo.Id, ToolResultForHistory, ToolImages);
+		SaveToolCallToSession(CallInfo.Name, CallInfo.Arguments, ToolResult);
 
 		OnToolResult.Broadcast(CallInfo.Id, ToolResult);
 	}
@@ -2720,5 +2766,165 @@ bool UUnrealGPTAgentClient::DetectTaskCompletion(const TArray<FString>& ToolName
 	}
 
 	return bCompletionDetected;
+}
+
+// ==================== SESSION PERSISTENCE ====================
+
+bool UUnrealGPTAgentClient::LoadConversation(const FString& SessionId)
+{
+	if (!SessionManager)
+	{
+		UE_LOG(LogTemp, Error, TEXT("UnrealGPT: SessionManager is null, cannot load conversation"));
+		return false;
+	}
+
+	FSessionData LoadedSession;
+	if (!SessionManager->LoadSession(SessionId, LoadedSession))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Failed to load session: %s"), *SessionId);
+		return false;
+	}
+
+	// Save current session before switching
+	if (!ConversationSessionId.IsEmpty())
+	{
+		SessionManager->SaveCurrentSession();
+		SessionManager->EndAutoSave();
+	}
+
+	// Clear current state
+	ClearHistory();
+
+	// Restore state from loaded session
+	ConversationSessionId = SessionId;
+	PreviousResponseId = LoadedSession.PreviousResponseId;
+
+	// Rebuild conversation history from persisted messages
+	for (const FPersistedMessage& Msg : LoadedSession.Messages)
+	{
+		FAgentMessage AgentMsg;
+		AgentMsg.Role = Msg.Role;
+		AgentMsg.Content = Msg.Content;
+		AgentMsg.ToolCallIds = Msg.ToolCallIds;
+		AgentMsg.ToolCallId = Msg.ToolCallId;
+		AgentMsg.ToolCallsJson = Msg.ToolCallsJson;
+		ConversationHistory.Add(AgentMsg);
+	}
+
+	// Set up session manager to track this session
+	// IMPORTANT: BeginAutoSave must be called BEFORE SetCurrentSessionData because
+	// BeginAutoSave initializes CurrentSessionData to empty. We then overwrite with loaded data.
+	SessionManager->BeginAutoSave(SessionId);
+	SessionManager->SetCurrentSessionData(LoadedSession);
+
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Loaded conversation %s with %d messages"), *SessionId, ConversationHistory.Num());
+
+	return true;
+}
+
+TArray<FSessionInfo> UUnrealGPTAgentClient::GetSessionList() const
+{
+	if (SessionManager)
+	{
+		return SessionManager->GetSessionList();
+	}
+	return TArray<FSessionInfo>();
+}
+
+void UUnrealGPTAgentClient::SaveUserMessageToSession(const FString& UserMessage, const TArray<FString>& Images)
+{
+	if (!SessionManager || !SessionManager->IsAutoSaveActive())
+	{
+		return;
+	}
+
+	FPersistedMessage Msg;
+	Msg.Role = TEXT("user");
+	Msg.Content = UserMessage;
+	Msg.ImageBase64 = Images;
+	Msg.Timestamp = FDateTime::Now();
+
+	SessionManager->AppendMessage(Msg);
+}
+
+void UUnrealGPTAgentClient::SaveAssistantMessageToSession(const FString& Content, const TArray<FString>& ToolCallIds, const FString& ToolCallsJson)
+{
+	if (!SessionManager || !SessionManager->IsAutoSaveActive())
+	{
+		return;
+	}
+
+	FPersistedMessage Msg;
+	Msg.Role = TEXT("assistant");
+	Msg.Content = Content;
+	Msg.ToolCallIds = ToolCallIds;
+	Msg.ToolCallsJson = ToolCallsJson;
+	Msg.Timestamp = FDateTime::Now();
+
+	SessionManager->AppendMessage(Msg);
+
+	// Trigger save after assistant response
+	SessionManager->SaveCurrentSession();
+}
+
+void UUnrealGPTAgentClient::SaveToolMessageToSession(const FString& ToolCallId, const FString& Result, const TArray<FString>& Images)
+{
+	if (!SessionManager || !SessionManager->IsAutoSaveActive())
+	{
+		return;
+	}
+
+	FPersistedMessage Msg;
+	Msg.Role = TEXT("tool");
+	Msg.ToolCallId = ToolCallId;
+	Msg.Content = Result;
+	Msg.ImageBase64 = Images;
+	Msg.Timestamp = FDateTime::Now();
+
+	SessionManager->AppendMessage(Msg);
+}
+
+void UUnrealGPTAgentClient::SaveToolCallToSession(const FString& ToolName, const FString& Arguments, const FString& Result)
+{
+	if (!SessionManager || !SessionManager->IsAutoSaveActive())
+	{
+		return;
+	}
+
+	FPersistedToolCall ToolCall;
+	ToolCall.ToolName = ToolName;
+	ToolCall.Arguments = Arguments;
+	ToolCall.Result = Result;
+	ToolCall.Timestamp = FDateTime::Now();
+
+	SessionManager->AppendToolCall(ToolCall);
+}
+
+TArray<FString> UUnrealGPTAgentClient::ExtractImagesFromToolResult(const FString& ToolResult) const
+{
+	TArray<FString> Images;
+
+	// Check for the image separator pattern used by viewport_screenshot
+	const FString ImageSeparator = TEXT("\n__IMAGE_BASE64__\n");
+	int32 SeparatorIndex = ToolResult.Find(ImageSeparator);
+
+	if (SeparatorIndex != INDEX_NONE)
+	{
+		FString ImageBase64 = ToolResult.Mid(SeparatorIndex + ImageSeparator.Len());
+		if (!ImageBase64.IsEmpty())
+		{
+			Images.Add(ImageBase64);
+		}
+	}
+	else
+	{
+		// Check if the entire result is a base64 image (PNG or JPEG header)
+		if (ToolResult.StartsWith(TEXT("iVBORw0KGgo")) || ToolResult.StartsWith(TEXT("/9j/")))
+		{
+			Images.Add(ToolResult);
+		}
+	}
+
+	return Images;
 }
 

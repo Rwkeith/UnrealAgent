@@ -4,7 +4,11 @@
 #include "UObject/NoExportTypes.h"
 #include "Http.h"
 #include "Dom/JsonObject.h"
+#include "UnrealGPTSessionTypes.h"
 #include "UnrealGPTAgentClient.generated.h"
+
+// Forward declarations
+class UUnrealGPTSessionManager;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnAgentMessage, const FString&, Role, const FString&, Content, const TArray<FString>&, ToolCalls);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnAgentReasoning, const FString&, ReasoningContent);
@@ -82,6 +86,20 @@ public:
 
 	/** Start a new conversation - closes current log file and creates a new session */
 	void StartNewConversation();
+
+	// ==================== SESSION MANAGEMENT ====================
+
+	/** Load a previous conversation session */
+	bool LoadConversation(const FString& SessionId);
+
+	/** Get list of available sessions */
+	TArray<FSessionInfo> GetSessionList() const;
+
+	/** Get the session manager */
+	UUnrealGPTSessionManager* GetSessionManager() const { return SessionManager; }
+
+	/** Get current session ID */
+	FString GetCurrentSessionId() const { return ConversationSessionId; }
 
 	/** Delegate for agent messages */
 	UPROPERTY(BlueprintAssignable)
@@ -210,5 +228,29 @@ private:
 
 	/** Generate a new session ID based on current timestamp */
 	static FString GenerateSessionId();
+
+	// ==================== SESSION PERSISTENCE ====================
+
+	/** Session manager for conversation persistence */
+	UPROPERTY()
+	UUnrealGPTSessionManager* SessionManager;
+
+	/** Images attached to the current message being sent */
+	TArray<FString> CurrentMessageImages;
+
+	/** Helper to save user message to session */
+	void SaveUserMessageToSession(const FString& UserMessage, const TArray<FString>& Images);
+
+	/** Helper to save assistant message to session */
+	void SaveAssistantMessageToSession(const FString& Content, const TArray<FString>& ToolCallIds, const FString& ToolCallsJson);
+
+	/** Helper to save tool message to session */
+	void SaveToolMessageToSession(const FString& ToolCallId, const FString& Result, const TArray<FString>& Images);
+
+	/** Helper to save tool call for UI reconstruction */
+	void SaveToolCallToSession(const FString& ToolName, const FString& Arguments, const FString& Result);
+
+	/** Extract base64 images from tool result string */
+	TArray<FString> ExtractImagesFromToolResult(const FString& ToolResult) const;
 };
 

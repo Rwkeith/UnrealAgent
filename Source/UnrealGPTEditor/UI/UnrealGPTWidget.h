@@ -6,11 +6,13 @@
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
+#include "Widgets/Input/SComboBox.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SListView.h"
 #include "Widgets/Views/STableViewBase.h"
 #include "Widgets/Views/STableRow.h"
 #include "UnrealGPTAgentClient.h"
+#include "UnrealGPTSessionTypes.h"
 
 // Forward declarations
 struct FSlateBrush;
@@ -56,6 +58,26 @@ private:
 
 	/** Handle new conversation button clicked */
 	FReply OnNewConversationClicked();
+
+	// ==================== SESSION MANAGEMENT ====================
+
+	/** Refresh the session dropdown options */
+	void RefreshSessionDropdown();
+
+	/** Handle session selection from dropdown */
+	void OnSessionSelected(TSharedPtr<FSessionInfo> NewSelection, ESelectInfo::Type SelectInfo);
+
+	/** Generate widget for session dropdown item */
+	TSharedRef<SWidget> GenerateSessionComboItem(TSharedPtr<FSessionInfo> InItem);
+
+	/** Get the text to display for current session */
+	FText GetCurrentSessionText() const;
+
+	/** Rebuild chat history UI from a loaded session */
+	void RebuildChatHistoryFromSession();
+
+	/** Display a base64 image in chat history */
+	void DisplayImageFromBase64(const FString& ImageBase64);
 
 	/** Handle settings button clicked */
 	FReply OnSettingsClicked();
@@ -154,5 +176,16 @@ private:
 
 	/** Text block used to display the latest reasoning summary from the agent */
 	TSharedPtr<class STextBlock> ReasoningSummaryText;
+
+	// ==================== SESSION MANAGEMENT ====================
+
+	/** Session dropdown combobox */
+	TSharedPtr<SComboBox<TSharedPtr<FSessionInfo>>> SessionComboBox;
+
+	/** Session dropdown options (shared pointers for Slate) */
+	TArray<TSharedPtr<FSessionInfo>> SessionComboOptions;
+
+	/** Currently selected session in dropdown */
+	TSharedPtr<FSessionInfo> CurrentSelectedSession;
 };
 

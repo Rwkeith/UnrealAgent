@@ -16,7 +16,8 @@ public class UnrealGPTEditor : ModuleRules
 				ModuleDirectory,
 				System.IO.Path.Combine(ModuleDirectory, "Agent"),
 				System.IO.Path.Combine(ModuleDirectory, "Tools"),
-				System.IO.Path.Combine(ModuleDirectory, "UI")
+				System.IO.Path.Combine(ModuleDirectory, "UI"),
+				System.IO.Path.Combine(ModuleDirectory, "Session")
 			}
 		);
 			
