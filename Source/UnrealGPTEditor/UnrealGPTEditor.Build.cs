@@ -13,6 +13,10 @@ public class UnrealGPTEditor : ModuleRules
 				
 		PrivateIncludePaths.AddRange(
 			new string[] {
+				ModuleDirectory,
+				System.IO.Path.Combine(ModuleDirectory, "Agent"),
+				System.IO.Path.Combine(ModuleDirectory, "Tools"),
+				System.IO.Path.Combine(ModuleDirectory, "UI")
 			}
 		);
 			

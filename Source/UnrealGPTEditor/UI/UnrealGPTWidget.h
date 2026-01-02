@@ -12,8 +12,9 @@
 #include "Widgets/Views/STableRow.h"
 #include "UnrealGPTAgentClient.h"
 
-// Forward declaration from Slate (declared as struct in Engine headers)
+// Forward declarations
 struct FSlateBrush;
+class UTexture2D;
 
 class SUnrealGPTWidget : public SCompoundWidget
 {
@@ -53,6 +54,9 @@ private:
 	/** Handle clear history button clicked */
 	FReply OnClearHistoryClicked();
 
+	/** Handle new conversation button clicked */
+	FReply OnNewConversationClicked();
+
 	/** Handle settings button clicked */
 	FReply OnSettingsClicked();
 
@@ -86,12 +90,16 @@ private:
 	/** Handle tool result delegate - called from agent client */
 	void HandleToolResult(const FString& ToolCallId, const FString& Result);
 
-	/** Agent client instance */
-	UPROPERTY()
+	/** Agent client instance.
+	 *  NOTE: This is a raw pointer in a Slate widget (not a UObject), so UPROPERTY() cannot be used.
+	 *  AddToRoot() is called immediately after NewObject() in Construct() to prevent garbage collection.
+	 */
 	UUnrealGPTAgentClient* AgentClient;
 
-	/** Delegate handler for dynamic delegates */
-	UPROPERTY()
+	/** Delegate handler for dynamic delegates.
+	 *  NOTE: This is a raw pointer in a Slate widget (not a UObject), so UPROPERTY() cannot be used.
+	 *  AddToRoot() is called immediately after NewObject() in Construct() to prevent garbage collection.
+	 */
 	class UUnrealGPTWidgetDelegateHandler* DelegateHandler;
 
 	/** Chat history scroll box */
@@ -109,6 +117,9 @@ private:
 	/** Clear history button */
 	TSharedPtr<SButton> ClearHistoryButton;
 
+	/** New conversation button */
+	TSharedPtr<SButton> NewConversationButton;
+
 	/** Settings button */
 	TSharedPtr<SButton> SettingsButton;
 
@@ -118,8 +129,10 @@ private:
 	/** Screenshot preview image */
 	TSharedPtr<class SImage> ScreenshotPreview;
 
-	/** Voice input instance */
-	UPROPERTY()
+	/** Voice input instance.
+	 *  NOTE: This is a raw pointer in a Slate widget (not a UObject), so UPROPERTY() cannot be used.
+	 *  AddToRoot() is called immediately after NewObject() in Construct() to prevent garbage collection.
+	 */
 	class UUnrealGPTVoiceInput* VoiceInput;
 
 	/** Tool call list */
@@ -130,6 +143,11 @@ private:
 
 	/** Persistent brushes for screenshots to ensure Slate does not reference freed memory */
 	TArray<TSharedPtr<FSlateBrush>> ScreenshotBrushes;
+
+	/** Persistent textures for screenshots that have been rooted to prevent GC.
+	 *  Each texture has AddToRoot() called when created to prevent garbage collection.
+	 */
+	TArray<UTexture2D*> ScreenshotTextures;
 
 	/** Compact, dynamic area that shows when the agent is reasoning and its reasoning summary */
 	TSharedPtr<class SBorder> ReasoningStatusBorder;

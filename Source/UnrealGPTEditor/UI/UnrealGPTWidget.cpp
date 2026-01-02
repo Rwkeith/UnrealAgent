@@ -116,6 +116,39 @@ namespace
 		return MakeGeistFont(10, false, true);
 	}
 
+	// Create a read-only, selectable/copyable text widget for displaying results.
+	// Uses SMultiLineEditableTextBox with IsReadOnly(true) to enable text selection and Ctrl+C copying.
+	TSharedRef<SWidget> CreateSelectableTextWidget(const FString& Text, const FSlateFontInfo& Font, const FLinearColor& TextColor = FLinearColor(0.9f, 0.9f, 0.9f, 1.0f), bool bAutoWrap = true)
+	{
+		// Use a static style that persists beyond this function call
+		// The style needs to live as long as the widget, so we create a shared copy
+		static TSharedPtr<FEditableTextBoxStyle> BaseStyle;
+		if (!BaseStyle.IsValid())
+		{
+			BaseStyle = MakeShareable(new FEditableTextBoxStyle(FCoreStyle::Get().GetWidgetStyle<FEditableTextBoxStyle>("NormalEditableTextBox")));
+			BaseStyle->SetBackgroundImageNormal(FSlateNoResource());
+			BaseStyle->SetBackgroundImageHovered(FSlateNoResource());
+			BaseStyle->SetBackgroundImageFocused(FSlateNoResource());
+			BaseStyle->SetBackgroundImageReadOnly(FSlateNoResource());
+			BaseStyle->SetPadding(FMargin(0.0f));
+			BaseStyle->SetBackgroundColor(FLinearColor::Transparent);
+			// Set scroll bar style to invisible/minimal to avoid visual clutter
+			BaseStyle->ScrollBarStyle.SetHorizontalBackgroundImage(FSlateNoResource());
+			BaseStyle->ScrollBarStyle.SetVerticalBackgroundImage(FSlateNoResource());
+		}
+
+		return SNew(SMultiLineEditableTextBox)
+			.Text(FText::FromString(Text))
+			.IsReadOnly(true)
+			.AutoWrapText(bAutoWrap)
+			.Style(BaseStyle.Get())
+			.Font(Font)
+			.ForegroundColor(FSlateColor(TextColor))
+			.Padding(FMargin(0.0f))
+			.SelectAllTextWhenFocused(false)
+			.AllowContextMenu(true); // Enable right-click context menu for copy
+	}
+
 	// Render a single chat line with very lightweight inline markdown support.
 	// Currently supports only **bold** spans, mapped to the Geist bold font.
 	TSharedRef<SWidget> CreateInlineMarkdownTextWidget(const FString& Line)
@@ -188,12 +221,14 @@ namespace
 
 void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 {
-	// Create agent client
+	// Create agent client - AddToRoot immediately to prevent GC before Initialize()
 	AgentClient = NewObject<UUnrealGPTAgentClient>();
+	AgentClient->AddToRoot();
 	AgentClient->Initialize();
 
-	// Create delegate handler for dynamic delegate bindings
+	// Create delegate handler for dynamic delegate bindings - AddToRoot immediately to prevent GC before Initialize()
 	DelegateHandler = NewObject<UUnrealGPTWidgetDelegateHandler>();
+	DelegateHandler->AddToRoot();
 	DelegateHandler->Initialize(this);
 
 	// Bind delegates using UFunction bindings through the handler
@@ -202,8 +237,9 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 	AgentClient->OnToolCall.AddDynamic(DelegateHandler, &UUnrealGPTWidgetDelegateHandler::OnToolCallReceived);
 	AgentClient->OnToolResult.AddDynamic(DelegateHandler, &UUnrealGPTWidgetDelegateHandler::OnToolResultReceived);
 
-	// Create voice input instance
+	// Create voice input instance - AddToRoot immediately to prevent GC before Initialize()
 	VoiceInput = NewObject<UUnrealGPTVoiceInput>();
+	VoiceInput->AddToRoot();
 	VoiceInput->Initialize();
 	VoiceInput->OnTranscriptionComplete.AddDynamic(DelegateHandler, &UUnrealGPTWidgetDelegateHandler::OnTranscriptionCompleteReceived);
 	VoiceInput->OnRecordingStarted.AddDynamic(DelegateHandler, &UUnrealGPTWidgetDelegateHandler::OnRecordingStartedReceived);
@@ -302,8 +338,43 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 								]
 							]
 						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.Padding(0.0f, 0.0f, 8.0f, 0.0f)
+						[
+							SNew(SBox)
+							.MinDesiredWidth(140.0f)
+							[
+								SAssignNew(NewConversationButton, SButton)
+								.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+								.ForegroundColor(FSlateColor::UseForeground())
+								.ContentPadding(FMargin(10.0f, 6.0f))
+								.OnClicked(this, &SUnrealGPTWidget::OnNewConversationClicked)
+								[
+									SNew(SHorizontalBox)
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(0.0f, 0.0f, 6.0f, 0.0f)
+									[
+										SNew(STextBlock)
+										.Font(FAppStyle::Get().GetFontStyle("FontAwesome.11"))
+										.Text(FText::FromString(FString(TEXT("\xf067")))) // Plus icon
+										.ColorAndOpacity(FLinearColor(0.4f, 0.7f, 0.4f))
+									]
+									+ SHorizontalBox::Slot()
+									.VAlign(VAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(NSLOCTEXT("UnrealGPT", "NewConversation", "New Conversation"))
+										.Font(FAppStyle::GetFontStyle("SmallFont"))
+									]
+								]
+							]
+						]
 					]
-					
+
 					// Spacer
 					+ SHorizontalBox::Slot()
 					.FillWidth(1.0f)
@@ -468,13 +539,13 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 								.Font(FAppStyle::Get().GetFontStyle("FontAwesome.14"))
 								.Text_Lambda([this]() -> FText
 								{
-									return FText::FromString(VoiceInput && VoiceInput->IsRecording() 
+									return FText::FromString(IsValid(VoiceInput) && VoiceInput->IsRecording()
 										? FString(TEXT("\xf130")) // Stop icon when recording
 										: FString(TEXT("\xf130"))); // Microphone icon
 								})
 								.ColorAndOpacity_Lambda([this]() -> FSlateColor
 								{
-									return VoiceInput && VoiceInput->IsRecording() 
+									return IsValid(VoiceInput) && VoiceInput->IsRecording()
 										? FSlateColor(FLinearColor(1.0f, 0.3f, 0.3f, 1.0f)) // Red when recording
 										: FSlateColor(FLinearColor(0.8f, 0.8f, 0.8f, 1.0f)); // Gray when not recording
 								})
@@ -631,17 +702,18 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateMarkdownWidget(const FString& Conten
 			continue;
 		}
 
-		// Lines inside fenced code block: monospace, no wrapping
+		// Lines inside fenced code block: monospace, no wrapping, selectable for copying
 		if (bInCodeBlock)
 		{
 			Container->AddSlot()
 				.AutoHeight()
 				[
-					SNew(STextBlock)
-					.Text(FText::FromString(Line))
-					.AutoWrapText(false)
-					.Font(FCoreStyle::GetDefaultFontStyle("Mono", 9))
-					.ColorAndOpacity(FLinearColor(0.9f, 0.9f, 0.9f, 1.0f))
+					CreateSelectableTextWidget(
+						Line,
+						FCoreStyle::GetDefaultFontStyle("Mono", 9),
+						FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
+						false /* bAutoWrap */
+					)
 				];
 			continue;
 		}
@@ -858,11 +930,13 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 				.Padding(FMargin(8.0f))
 				.BorderBackgroundColor(FLinearColor(0.05f, 0.05f, 0.05f, 1.0f))
 				[
-					SNew(STextBlock)
-					.Text(FText::FromString(Code.TrimStartAndEnd()))
-					.Font(FCoreStyle::GetDefaultFontStyle("Mono", 9))
-					.ColorAndOpacity(FLinearColor(0.9f, 0.9f, 0.9f, 1.0f))
-					.AutoWrapText(true)
+					// Use selectable text widget so users can copy Python code
+					CreateSelectableTextWidget(
+						Code.TrimStartAndEnd(),
+						FCoreStyle::GetDefaultFontStyle("Mono", 9),
+						FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
+						true /* bAutoWrap */
+					)
 				]
 			];
 	}
@@ -1173,7 +1247,7 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolCallWidget(const FString& ToolNa
 
 FReply SUnrealGPTWidget::OnSendClicked()
 {
-	if (!InputTextBox.IsValid() || !AgentClient)
+	if (!InputTextBox.IsValid() || !IsValid(AgentClient))
 	{
 		return FReply::Handled();
 	}
@@ -1225,16 +1299,18 @@ FReply SUnrealGPTWidget::OnSendClicked()
 
 FReply SUnrealGPTWidget::OnRequestContextClicked()
 {
-	if (!AgentClient)
+	if (!IsValid(AgentClient))
 	{
 		return FReply::Handled();
 	}
 
-	// Capture screenshot
-	FString ScreenshotBase64 = UUnrealGPTSceneContext::CaptureViewportScreenshot();
-	
-	// Get scene summary
-	FString SceneSummary = UUnrealGPTSceneContext::GetSceneSummary(100);
+	// Capture screenshot - use resized version to avoid massive payloads
+	// Resizes to max 1024x768 and uses JPEG compression for much smaller size
+	FString ScreenshotBase64 = UUnrealGPTSceneContext::CaptureViewportScreenshotResized(1024, 768);
+
+	// Get compact scene summary (no component details) to avoid overwhelming the API
+	// The compact summary only includes actor name, label, class, and location
+	FString SceneSummary = UUnrealGPTSceneContext::GetCompactSceneSummary(50);
 
 	// Build context message
 	FString ContextMessage = FString::Printf(
@@ -1264,7 +1340,7 @@ FReply SUnrealGPTWidget::OnRequestContextClicked()
 
 FReply SUnrealGPTWidget::OnClearHistoryClicked()
 {
-	if (AgentClient)
+	if (IsValid(AgentClient))
 	{
 		AgentClient->ClearHistory();
 	}
@@ -1278,6 +1354,60 @@ FReply SUnrealGPTWidget::OnClearHistoryClicked()
 	PendingAttachedImages.Empty();
 
 	ToolCallHistory.Empty();
+
+	// Clean up screenshot textures - remove from root so they can be garbage collected
+	for (UTexture2D* Texture : ScreenshotTextures)
+	{
+		if (IsValid(Texture) && Texture->IsRooted())
+		{
+			Texture->RemoveFromRoot();
+		}
+	}
+	ScreenshotTextures.Empty();
+	ScreenshotBrushes.Empty();
+
+	// Hide reasoning status as the conversation has been reset
+	if (ReasoningStatusBorder.IsValid())
+	{
+		ReasoningStatusBorder->SetVisibility(EVisibility::Collapsed);
+	}
+	if (ReasoningSummaryText.IsValid())
+	{
+		ReasoningSummaryText->SetText(FText::GetEmpty());
+	}
+
+	return FReply::Handled();
+}
+
+FReply SUnrealGPTWidget::OnNewConversationClicked()
+{
+	// Start a new conversation session (creates new log file, clears history)
+	if (IsValid(AgentClient))
+	{
+		AgentClient->StartNewConversation();
+	}
+
+	// Clear the UI (same as clear history)
+	if (ChatHistoryBox.IsValid())
+	{
+		ChatHistoryBox->ClearChildren();
+	}
+
+	// Clear pending attachments
+	PendingAttachedImages.Empty();
+
+	ToolCallHistory.Empty();
+
+	// Clean up screenshot textures - remove from root so they can be garbage collected
+	for (UTexture2D* Texture : ScreenshotTextures)
+	{
+		if (IsValid(Texture) && Texture->IsRooted())
+		{
+			Texture->RemoveFromRoot();
+		}
+	}
+	ScreenshotTextures.Empty();
+	ScreenshotBrushes.Empty();
 
 	// Hide reasoning status as the conversation has been reset
 	if (ReasoningStatusBorder.IsValid())
@@ -1458,9 +1588,12 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 		return;
 	}
 
-	// Check if this is a base64-encoded screenshot (PNG)
+	// Check if this is a base64-encoded screenshot (PNG or JPEG)
 	bool bIsScreenshot = false;
-	if (Trimmed.StartsWith(TEXT("iVBORw0KGgo")) && Trimmed.Len() > 100) // Base64 PNG header + reasonable size
+	// PNG base64 header: iVBORw0KGgo
+	// JPEG base64 header: /9j/4AAQSkZJRg (standard JFIF) or /9j/4 (other JPEG variants)
+	if (Trimmed.Len() > 100 &&
+		(Trimmed.StartsWith(TEXT("iVBORw0KGgo")) || Trimmed.StartsWith(TEXT("/9j/"))))
 	{
 		bIsScreenshot = true;
 	}
@@ -1583,9 +1716,19 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 			if (FBase64::Decode(Trimmed, ImageData))
 			{
 				IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-				TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
-				
-				if (ImageWrapper.IsValid() && ImageWrapper->SetCompressed(ImageData.GetData(), ImageData.Num()))
+
+				// Try JPEG first (resized screenshots), then fall back to PNG (original full-res)
+				TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::JPEG);
+				bool bImageLoaded = ImageWrapper.IsValid() && ImageWrapper->SetCompressed(ImageData.GetData(), ImageData.Num());
+
+				if (!bImageLoaded)
+				{
+					// Try PNG as fallback
+					ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+					bImageLoaded = ImageWrapper.IsValid() && ImageWrapper->SetCompressed(ImageData.GetData(), ImageData.Num());
+				}
+
+				if (bImageLoaded)
 				{
 					TArray<uint8> UncompressedBGRA;
 					if (ImageWrapper->GetRaw(ERGBFormat::BGRA, 8, UncompressedBGRA))
@@ -1593,8 +1736,12 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 						int32 Width = ImageWrapper->GetWidth();
 						int32 Height = ImageWrapper->GetHeight();
 						
+						// Generate unique texture name using timestamp to prevent texture reuse
+						static int32 ScreenshotCounter = 0;
+						const FString TextureName = FString::Printf(TEXT("ScreenshotTexture_%d_%lld"), ScreenshotCounter++, FDateTime::Now().GetTicks());
+
 						// Create texture on game thread using FImageUtils (UE5.6 compatible)
-						AsyncTask(ENamedThreads::GameThread, [this, Width, Height, UncompressedBGRA]()
+						AsyncTask(ENamedThreads::GameThread, [this, Width, Height, UncompressedBGRA, TextureName]()
 						{
 							// Widget may have been destroyed between scheduling and execution
 							if (!ChatHistoryBox.IsValid())
@@ -1618,18 +1765,24 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 							
 							// Create texture using FImageUtils (UE5.6 compatible API).
 							// Use the transient package as the outer so the texture is not considered for saving/packaging.
+							// Each texture gets a unique name to prevent Unreal from reusing/updating existing textures.
 							FCreateTexture2DParameters TextureParams;
 							UTexture2D* Texture = FImageUtils::CreateTexture2D(
 								Width,
 								Height,
 								ColorData,
 								GetTransientPackage(),			// Outer
-								TEXT("ScreenshotTexture"),		// Name
+								*TextureName,					// Unique name per screenshot
 								RF_Transient,					// Flags (not saved/packaged)
 								TextureParams);
 							
 							if (Texture)
 							{
+								// Root the texture to prevent garbage collection during PIE transitions.
+								// Slate brushes hold raw pointers to textures, so we must keep them alive.
+								Texture->AddToRoot();
+								ScreenshotTextures.Add(Texture);
+
 								// Create brush from texture (using MakeShareable for proper memory management)
 								TSharedPtr<FSlateBrush> Brush = MakeShareable(new FSlateBrush());
 								Brush->SetResourceObject(Texture);
@@ -1743,11 +1896,13 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 						+ SVerticalBox::Slot()
 						.AutoHeight()
 						[
-							SNew(STextBlock)
-							.Text(FText::FromString(DisplayText))
-							.AutoWrapText(true)
-							.Font(bIsSceneQueryResult ? GetUnrealGPTBodyFont() : FCoreStyle::GetDefaultFontStyle("Mono", 8))
-							.ColorAndOpacity(FLinearColor(0.9f, 0.9f, 0.9f, 1.0f))
+							// Use selectable text widget so users can copy tool results
+							CreateSelectableTextWidget(
+								DisplayText,
+								bIsSceneQueryResult ? GetUnrealGPTBodyFont() : FCoreStyle::GetDefaultFontStyle("Mono", 8),
+								FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
+								true /* bAutoWrap */
+							)
 						]
 					]
 				]
@@ -1757,7 +1912,7 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 
 FReply SUnrealGPTWidget::OnVoiceInputClicked()
 {
-	if (!VoiceInput)
+	if (!IsValid(VoiceInput))
 	{
 		return FReply::Handled();
 	}

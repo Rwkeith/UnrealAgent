@@ -25,6 +25,11 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "API", meta = (DisplayName = "API Key", ConfigRestartRequired = false))
 	FString ApiKey;
 
+	/** OpenAI Vector Store ID for file_search tool (optional). If empty, file_search will be disabled.
+	 *  Create a vector store at https://platform.openai.com/storage/vector_stores and upload UE Python API docs. */
+	UPROPERTY(config, EditAnywhere, Category = "API", meta = (DisplayName = "Vector Store ID"))
+	FString VectorStoreId;
+
 	/** Default model to use (e.g., gpt-5.1) */
 	UPROPERTY(config, EditAnywhere, Category = "Model", meta = (DisplayName = "Default Model"))
 	FString DefaultModel = TEXT("gpt-5.1");
@@ -81,13 +86,13 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Replicate", meta = (DisplayName = "Video Model"))
 	FString ReplicateVideoModel;
 
-	/** Maximum execution timeout in seconds */
+	/** Maximum execution timeout in seconds (recommended: 90-120 for reasoning models like gpt-5/o1/o3) */
 	UPROPERTY(config, EditAnywhere, Category = "Safety", meta = (DisplayName = "Execution Timeout (seconds)"))
-	float ExecutionTimeoutSeconds = 30.0f;
+	float ExecutionTimeoutSeconds = 90.0f;
 
-	/** Maximum number of consecutive tool call iterations before stopping to prevent infinite loops. */
-	UPROPERTY(config, EditAnywhere, Category = "Safety", meta = (DisplayName = "Max Tool Call Iterations", ClampMin = "1", UIMin = "1"))
-	int32 MaxToolCallIterations = 25;
+	/** Maximum number of consecutive tool call iterations before stopping to prevent infinite loops. Set to 0 for unlimited. */
+	UPROPERTY(config, EditAnywhere, Category = "Safety", meta = (DisplayName = "Max Tool Call Iterations", ClampMin = "0", UIMin = "0"))
+	int32 MaxToolCallIterations = 100;
 
 	/** Maximum context tokens per request */
 	UPROPERTY(config, EditAnywhere, Category = "Context", meta = (DisplayName = "Max Context Tokens"))

@@ -47,6 +47,16 @@ struct FToolDefinition
 	FString ParametersSchema; // JSON schema as string
 };
 
+/**
+ * Information about a tool call extracted from API response.
+ */
+struct FToolCallInfo
+{
+	FString Id;
+	FString Name;
+	FString Arguments;
+};
+
 UCLASS()
 class UNREALGPTEDITOR_API UUnrealGPTAgentClient : public UObject
 {
@@ -69,6 +79,9 @@ public:
 
 	/** Clear conversation history */
 	void ClearHistory();
+
+	/** Start a new conversation - closes current log file and creates a new session */
+	void StartNewConversation();
 
 	/** Delegate for agent messages */
 	UPROPERTY(BlueprintAssignable)
@@ -99,6 +112,13 @@ private:
 	/** Process standard JSON response from Responses API (non-streaming) */
 	void ProcessResponsesApiResponse(const FString& ResponseContent);
 
+	// ==================== RESPONSE PROCESSING HELPERS ====================
+	/** Extract tool calls and text from Responses API output array */
+	void ExtractFromResponseOutput(const TArray<TSharedPtr<FJsonValue>>& OutputArray, TArray<FToolCallInfo>& OutToolCalls, FString& OutAccumulatedText);
+
+	/** Process extracted tool calls: execute them and continue conversation */
+	void ProcessExtractedToolCalls(const TArray<FToolCallInfo>& ToolCalls, const FString& AccumulatedText);
+
 	/** Execute a tool call */
 	FString ExecuteToolCall(const FString& ToolName, const FString& ArgumentsJson);
 
@@ -108,8 +128,30 @@ private:
 	// /** Execute Computer Use action */
 	// FString ExecuteComputerUse(const FString& ActionJson);
 
-	/** Get viewport screenshot */
-	FString GetViewportScreenshot();
+	// ==================== ATOMIC EDITOR TOOLS ====================
+	/** Get detailed actor info by label or name */
+	FString ExecuteGetActor(const FString& ArgumentsJson);
+
+	/** Set actor transform (location, rotation, scale) */
+	FString ExecuteSetActorTransform(const FString& ArgumentsJson);
+
+	/** Select actors by labels */
+	FString ExecuteSelectActors(const FString& ArgumentsJson);
+
+	/** Duplicate an actor with optional count and offset */
+	FString ExecuteDuplicateActor(const FString& ArgumentsJson);
+
+	/** Snap an actor to the ground below it */
+	FString ExecuteSnapActorToGround(const FString& ArgumentsJson);
+
+	/** Set rotation on multiple actors at once */
+	FString ExecuteSetActorsRotation(const FString& ArgumentsJson);
+
+	/** Helper: Find actor by label or name */
+	AActor* FindActorByLabelOrName(const FString& Label, const FString& Name);
+
+	/** Get viewport screenshot with optional focus actor and metadata output */
+	FString GetViewportScreenshot(const FString& ArgumentsJson, FString& OutMetadataJson);
 
 	/** Get scene summary */
 	FString GetSceneSummary(int32 PageSize = 100);
@@ -126,6 +168,15 @@ private:
 	/** Check if we're using the Responses API endpoint */
 	bool IsUsingResponsesApi() const;
 
+	/**
+	 * Determine appropriate reasoning effort level based on message complexity.
+	 * Returns "low", "medium", or "high".
+	 * - low: Simple tool calls, single-step operations
+	 * - medium: Multi-step tasks, scene building, some ambiguity
+	 * - high: Complex planning, reference image interpretation, architectural decisions
+	 */
+	FString DetermineReasoningEffort(const FString& UserMessage, const TArray<FString>& ImagePaths) const;
+
 	/** Detect if task completion can be inferred from recent tool results */
 	bool DetectTaskCompletion(const TArray<FString>& ToolNames, const TArray<FString>& ToolResults) const;
 
@@ -141,11 +192,7 @@ private:
 	/** Tool call iteration counter to prevent infinite loops */
 	int32 ToolCallIterationCount;
 
-	/** Maximum tool call iterations before stopping.
-	 *  Keep this relatively low so the agent cannot get stuck retrying the
-	 *  same step over and over after code execution.
-	 */
-	static constexpr int32 MaxToolCallIterations = 25;
+	// MaxToolCallIterations is now configurable via UUnrealGPTSettings
 
 	/** Maximum size (in characters) for tool results to include in conversation history and API requests.
 	 *  Large results (like base64 screenshots) will be truncated or summarized to prevent
@@ -182,5 +229,23 @@ private:
 
 	/** Cached copy of the last JSON request body, used for safe retry on specific API errors. */
 	FString LastRequestBody;
+
+	/** Retry counter for transient HTTP failures */
+	int32 HttpRetryCount = 0;
+
+	/** Retry counter for 429 rate limit errors (resets on success) */
+	int32 RateLimitRetryCount = 0;
+
+	/** Maximum rate limit retries before giving up */
+	static constexpr int32 MaxRateLimitRetries = 10;
+
+	/** Timestamp when the current HTTP request started (for timing/timeout diagnostics) */
+	double RequestStartTime = 0.0;
+
+	/** Current conversation session ID - used for naming log files */
+	FString ConversationSessionId;
+
+	/** Generate a new session ID based on current timestamp */
+	static FString GenerateSessionId();
 };
 

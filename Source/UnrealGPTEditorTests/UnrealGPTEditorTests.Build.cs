@@ -33,7 +33,10 @@ public class UnrealGPTEditorTests : ModuleRules
 		PublicIncludePaths.AddRange(
 			new string[]
 			{
-				Path.Combine(ModuleDirectory, "../UnrealGPTEditor")
+				Path.Combine(ModuleDirectory, "../UnrealGPTEditor"),
+				Path.Combine(ModuleDirectory, "../UnrealGPTEditor/Agent"),
+				Path.Combine(ModuleDirectory, "../UnrealGPTEditor/Tools"),
+				Path.Combine(ModuleDirectory, "../UnrealGPTEditor/UI")
 			}
 		);
 	}
