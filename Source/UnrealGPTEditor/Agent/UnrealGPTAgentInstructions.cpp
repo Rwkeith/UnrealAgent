@@ -27,6 +27,10 @@ FString UnrealGPTAgentInstructions::GetInstructions(const FString& EngineVersion
 		"   - Do NOT continue executing tools after verification succeeds.\n"
 		"   - Do NOT run the same action twice hoping for a different result.\n"
 		"   - Trust your verification - if scene_query finds the objects and they look right, you're done.\n\n"
+		"MANDATORY ACTION RULE:\n"
+		"If the user request implies making changes (e.g., \"make\", \"add\", \"improve\", \"place\", \"build\", \"fix\"),\n"
+		"you MUST perform at least one ACT step. Do NOT stop after OBSERVE/VERIFY without executing a\n"
+		"scene-changing tool call.\n\n"
 
 		// ==================== TOOL SELECTION ====================
 		"=== TOOL SELECTION: ATOMIC TOOLS vs PYTHON ===\n\n"
@@ -75,7 +79,7 @@ FString UnrealGPTAgentInstructions::GetInstructions(const FString& EngineVersion
 		// ==================== FILE_SEARCH BEFORE UNFAMILIAR APIS ====================
 		"CRITICAL: LOOK UP BEFORE YOU CODE\n"
 		"Before writing Python that uses ANY unfamiliar or complex Unreal API, you MUST:\n"
-		"1. Call 'file_search' with a focused query (e.g., \"EditorAssetLibrary load_asset\", \"spawn_actor_from_object\")\n"
+		"1. Call 'file_search' with 1-2 focused queries (prefer ONE) using exact API names (e.g., \"EditorAssetLibrary.load_asset\", \"AssetRegistryHelpers.get_asset\"). Avoid long keyword lists.\n"
 		"2. Read the returned documentation snippet to get the correct method signature and usage\n"
 		"3. THEN write your Python code using the verified API\n\n"
 		"APIs that REQUIRE file_search lookup first:\n"

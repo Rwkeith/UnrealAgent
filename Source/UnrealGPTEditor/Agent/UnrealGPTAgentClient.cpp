@@ -1806,36 +1806,198 @@ void UUnrealGPTAgentClient::ExtractFromResponseOutput(const TArray<TSharedPtr<FJ
 				OutputObj->TryGetStringField(TEXT("id"), CallId);
 			}
 
-			// Build a compact arguments JSON object for the UI
+			// Build a compact arguments JSON object for the UI (queries, status, etc.)
+			// Note: In the Responses API, queries/results are at the TOP LEVEL of the output object,
+			// not nested inside a "file_search" or "web_search" sub-object.
 			TSharedPtr<FJsonObject> ArgsJson = MakeShareable(new FJsonObject);
-			const FString NestedField = bIsFileSearch ? TEXT("file_search") : TEXT("web_search");
-			const TSharedPtr<FJsonObject>* NestedObjPtr = nullptr;
-			if (OutputObj->TryGetObjectField(NestedField, NestedObjPtr) && NestedObjPtr && (*NestedObjPtr).IsValid())
+
+			// Also extract results for UI display
+			FString ResultSummary;
+			int32 ResultCount = 0;
+
+			// Copy relevant fields to ArgsJson for UI display (skip results, we summarize separately)
+			for (const auto& Pair : OutputObj->Values)
 			{
-				for (const auto& Pair : (*NestedObjPtr)->Values)
+				if (Pair.Key != TEXT("results") && Pair.Key != TEXT("type") && Pair.Key != TEXT("id"))
 				{
 					ArgsJson->SetField(Pair.Key, Pair.Value);
 				}
 			}
 
+			// Extract results array (at top level of OutputObj)
+			const TArray<TSharedPtr<FJsonValue>>* ResultsArray = nullptr;
+			if (OutputObj->TryGetArrayField(TEXT("results"), ResultsArray) && ResultsArray)
+			{
+				ResultCount = ResultsArray->Num();
+				if (ResultCount > 0)
+				{
+					ResultSummary = FString::Printf(TEXT("Found %d result(s):\n\n"), ResultCount);
+
+					// Show up to 3 results with snippets
+					const int32 MaxToShow = FMath::Min(3, ResultCount);
+					for (int32 ResultIdx = 0; ResultIdx < MaxToShow; ++ResultIdx)
+					{
+						const TSharedPtr<FJsonObject> ResultObj = (*ResultsArray)[ResultIdx]->AsObject();
+						if (!ResultObj.IsValid()) continue;
+
+						FString FileName;
+						ResultObj->TryGetStringField(TEXT("filename"), FileName);
+						if (FileName.IsEmpty())
+						{
+							ResultObj->TryGetStringField(TEXT("name"), FileName);
+						}
+						if (FileName.IsEmpty())
+						{
+							ResultObj->TryGetStringField(TEXT("file_id"), FileName);
+						}
+						if (FileName.IsEmpty())
+						{
+							ResultObj->TryGetStringField(TEXT("id"), FileName);
+						}
+
+						// Try to get text snippet
+						FString Snippet;
+						const TArray<TSharedPtr<FJsonValue>>* TextArray = nullptr;
+						if (ResultObj->TryGetArrayField(TEXT("text"), TextArray) && TextArray && TextArray->Num() > 0)
+						{
+							// Text is often an array of content blocks
+							for (const auto& TextVal : *TextArray)
+							{
+								const TSharedPtr<FJsonObject> TextObj = TextVal->AsObject();
+								if (TextObj.IsValid())
+								{
+									FString TextContent;
+									if (TextObj->TryGetStringField(TEXT("text"), TextContent) && !TextContent.IsEmpty())
+									{
+										Snippet = TextContent.Left(150);
+										if (TextContent.Len() > 150) Snippet += TEXT("...");
+										break;
+									}
+								}
+							}
+						}
+						// Also try "content" arrays (Responses API blocks), then direct fields
+						if (Snippet.IsEmpty())
+						{
+							const TArray<TSharedPtr<FJsonValue>>* ContentArray = nullptr;
+							if (ResultObj->TryGetArrayField(TEXT("content"), ContentArray) && ContentArray && ContentArray->Num() > 0)
+							{
+								for (const auto& ContentVal : *ContentArray)
+								{
+									if (!ContentVal.IsValid())
+									{
+										continue;
+									}
+
+									FString ContentText;
+									if (ContentVal->Type == EJson::String && ContentVal->TryGetString(ContentText) && !ContentText.IsEmpty())
+									{
+										Snippet = ContentText;
+									}
+									else
+									{
+										const TSharedPtr<FJsonObject> ContentObj = ContentVal->AsObject();
+										if (ContentObj.IsValid())
+										{
+											if (ContentObj->TryGetStringField(TEXT("text"), ContentText) && !ContentText.IsEmpty())
+											{
+												Snippet = ContentText;
+											}
+											else if (ContentObj->TryGetStringField(TEXT("content"), ContentText) && !ContentText.IsEmpty())
+											{
+												Snippet = ContentText;
+											}
+											else if (ContentObj->TryGetStringField(TEXT("value"), ContentText) && !ContentText.IsEmpty())
+											{
+												Snippet = ContentText;
+											}
+										}
+									}
+
+									if (!Snippet.IsEmpty())
+									{
+										break;
+									}
+								}
+							}
+
+							if (Snippet.IsEmpty())
+							{
+								ResultObj->TryGetStringField(TEXT("text"), Snippet);
+							}
+							if (Snippet.IsEmpty())
+							{
+								ResultObj->TryGetStringField(TEXT("content"), Snippet);
+							}
+							if (Snippet.IsEmpty())
+							{
+								ResultObj->TryGetStringField(TEXT("snippet"), Snippet);
+							}
+							if (!Snippet.IsEmpty() && Snippet.Len() > 150)
+							{
+								Snippet = Snippet.Left(150) + TEXT("...");
+							}
+						}
+
+						// Optional relevance score if present
+						double ScoreValue = 0.0;
+						const bool bHasScore = ResultObj->TryGetNumberField(TEXT("score"), ScoreValue);
+						const FString ScoreSuffix = bHasScore
+							? FString::Printf(TEXT(" (score %.3f)"), ScoreValue)
+							: TEXT("");
+
+						ResultSummary += FString::Printf(TEXT("%d. %s%s\n"), ResultIdx + 1,
+							FileName.IsEmpty() ? TEXT("(unnamed)") : *FileName,
+							*ScoreSuffix);
+						if (!Snippet.IsEmpty())
+						{
+							ResultSummary += FString::Printf(TEXT("   %s\n"), *Snippet);
+						}
+						ResultSummary += TEXT("\n");
+					}
+
+					if (ResultCount > MaxToShow)
+					{
+						ResultSummary += FString::Printf(TEXT("... and %d more result(s)"), ResultCount - MaxToShow);
+					}
+				}
+				else
+				{
+					ResultSummary = TEXT("No results found.");
+				}
+			}
+
+			// Check status field (at top level)
+			FString Status;
+			OutputObj->TryGetStringField(TEXT("status"), Status);
+
 			FString ArgsString;
 			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ArgsString);
 			FJsonSerializer::Serialize(ArgsJson.ToSharedRef(), Writer);
 
-			// Broadcast to UI
+			// Broadcast tool call to UI
 			if (IsInGameThread())
 			{
 				OnToolCall.Broadcast(ToolName, ArgsString);
+				// Also broadcast results if we have them
+				if (!ResultSummary.IsEmpty())
+				{
+					OnToolResult.Broadcast(CallId, ResultSummary);
+				}
 			}
 			else
 			{
-				AsyncTask(ENamedThreads::GameThread, [this, ToolName, ArgsString]()
+				AsyncTask(ENamedThreads::GameThread, [this, ToolName, ArgsString, CallId, ResultSummary]()
 				{
 					OnToolCall.Broadcast(ToolName, ArgsString);
+					if (!ResultSummary.IsEmpty())
+					{
+						OnToolResult.Broadcast(CallId, ResultSummary);
+					}
 				});
 			}
 
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Recorded server-side search call for UI - tool: %s"), *ToolName);
+			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Server-side %s - status: %s, results: %d"), *ToolName, *Status, ResultCount);
 			// NOTE: NOT adding to OutToolCalls - these are server-side only
 		}
 		else if (OutputType == TEXT("message"))

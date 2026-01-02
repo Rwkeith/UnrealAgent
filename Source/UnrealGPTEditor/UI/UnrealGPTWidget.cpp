@@ -36,6 +36,7 @@
 #include "Misc/Paths.h"
 #include "Interfaces/IPluginManager.h"
 #include "Widgets/Layout/SWrapBox.h"
+#include "Widgets/Layout/SWidgetSwitcher.h"
 
 namespace
 {
@@ -149,34 +150,12 @@ namespace
 			.AllowContextMenu(true); // Enable right-click context menu for copy
 	}
 
-	// Render a single chat line with very lightweight inline markdown support.
-	// Currently supports only **bold** spans, mapped to the Geist bold font.
+	// Render a single chat line with inline markdown support using SRichTextBlock.
+	// Converts **bold** markers to rich text format for proper inline styling with word wrapping.
 	TSharedRef<SWidget> CreateInlineMarkdownTextWidget(const FString& Line)
 	{
-		const FLinearColor TextColor(0.95f, 0.95f, 0.95f, 1.0f);
-
-		TSharedRef<SWrapBox> WrapBox =
-			SNew(SWrapBox)
-			.UseAllottedSize(true)
-			.InnerSlotPadding(FVector2D::ZeroVector);
-
-		auto AddRun = [&WrapBox, &TextColor](const FString& Text, bool bBold)
-		{
-			if (Text.IsEmpty())
-			{
-				return;
-			}
-
-			WrapBox->AddSlot()
-			[
-				SNew(STextBlock)
-				.Text(FText::FromString(Text))
-				.AutoWrapText(true)
-				.Font(bBold ? GetUnrealGPTBodyBoldFont() : GetUnrealGPTBodyFont())
-				.ColorAndOpacity(TextColor)
-			];
-		};
-
+		// Convert **bold** markdown to rich text markup: **text** -> <RichTextBlock.Bold>text</>
+		FString RichText;
 		int32 Pos = 0;
 		const int32 Length = Line.Len();
 
@@ -186,36 +165,47 @@ namespace
 			if (Open == INDEX_NONE)
 			{
 				// No more bold markers; add the rest as normal text.
-				AddRun(Line.Mid(Pos), false);
+				RichText += Line.Mid(Pos);
 				break;
 			}
 
 			// Add any normal text before the bold span.
 			if (Open > Pos)
 			{
-				AddRun(Line.Mid(Pos, Open - Pos), false);
+				RichText += Line.Mid(Pos, Open - Pos);
 			}
 
 			const int32 Close = Line.Find(TEXT("**"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Open + 2);
 			if (Close == INDEX_NONE)
 			{
 				// Unmatched '**' – treat the remainder as normal text including the markers.
-				AddRun(Line.Mid(Open), false);
+				RichText += Line.Mid(Open);
 				break;
 			}
 
-			// Extract the bold span between the markers.
+			// Extract the bold span between the markers and wrap with rich text tags.
 			const int32 BoldStart = Open + 2;
 			const int32 BoldLen = Close - BoldStart;
 			if (BoldLen > 0)
 			{
-				AddRun(Line.Mid(BoldStart, BoldLen), true);
+				RichText += TEXT("<RichTextBlock.Bold>");
+				RichText += Line.Mid(BoldStart, BoldLen);
+				RichText += TEXT("</>");
 			}
 
 			Pos = Close + 2;
 		}
 
-		return WrapBox;
+		// Create a text style with our desired color and font
+		static FTextBlockStyle ChatTextStyle = FTextBlockStyle()
+			.SetFont(GetUnrealGPTBodyFont())
+			.SetColorAndOpacity(FSlateColor(FLinearColor(0.95f, 0.95f, 0.95f, 1.0f)));
+
+		return SNew(SRichTextBlock)
+			.Text(FText::FromString(RichText))
+			.AutoWrapText(true)
+			.DecoratorStyleSet(&FCoreStyle::Get())
+			.TextStyle(&ChatTextStyle);
 	}
 }
 
@@ -440,6 +430,8 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 					.Orientation(Orient_Vertical)
 					.ScrollBarAlwaysVisible(false)
 					.ConsumeMouseWheel(EConsumeMouseWheel::Always)
+					.ScrollWhenFocusChanges(EScrollWhenFocusChanges::NoScroll)
+					.WheelScrollMultiplier(3.0f)
 					+ SScrollBox::Slot()
 					.Padding(12.0f, 12.0f)
 					[
@@ -902,7 +894,7 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 		ToolColor = FLinearColor(0.2f, 0.5f, 0.8f, 1.0f);
 		ToolIcon = FString(TEXT("\xf121")); // Code icon
 		ToolDisplayName = TEXT("Python Execution");
-		
+
 		// Parse JSON to extract code cleanly
 		FString Code = Arguments;
 		TSharedPtr<FJsonObject> ArgsObj;
@@ -912,33 +904,160 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 			ArgsObj->TryGetStringField(TEXT("code"), Code);
 		}
 
-		ContentWidget = SNew(SVerticalBox)
-			+ SVerticalBox::Slot()
-			.AutoHeight()
+		Code = Code.TrimStartAndEnd();
+
+		// Count lines to determine if we need collapsible view
+		TArray<FString> CodeLines;
+		Code.ParseIntoArrayLines(CodeLines);
+		const int32 LineCount = CodeLines.Num();
+		const int32 MaxVisibleLines = 8;
+
+		// Build preview (first N lines) for collapsed state
+		FString CodePreview;
+		if (LineCount > MaxVisibleLines)
+		{
+			for (int32 i = 0; i < MaxVisibleLines; ++i)
+			{
+				CodePreview += CodeLines[i] + TEXT("\n");
+			}
+			CodePreview = CodePreview.TrimEnd();
+		}
+
+		// Create the code content widget
+		TSharedRef<SWidget> CodeContent = SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+			.Padding(FMargin(8.0f))
+			.BorderBackgroundColor(FLinearColor(0.05f, 0.05f, 0.05f, 1.0f))
 			[
-				SNew(STextBlock)
-				.Text(NSLOCTEXT("UnrealGPT", "PythonCode", "Script:"))
-				.Font(GetUnrealGPTSmallBodyFont())
-				.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f, 1.0f))
-			]
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				CreateSelectableTextWidget(
+					Code,
+					FCoreStyle::GetDefaultFontStyle("Mono", 9),
+					FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
+					true /* bAutoWrap */
+				)
+			];
+
+		if (LineCount > MaxVisibleLines)
+		{
+			// Large script: use widget switcher for clean expand/collapse without persistent header
+			TSharedPtr<SWidgetSwitcher> CodeSwitcher = SNew(SWidgetSwitcher)
+				.WidgetIndex(0); // Start collapsed (showing preview)
+
+			const int32 ExtraLines = LineCount - MaxVisibleLines;
+
+			// Slot 0: Collapsed state (preview + "Show more" button)
+			CodeSwitcher->AddSlot()
 			[
-				SNew(SBorder)
-				.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
-				.Padding(FMargin(8.0f))
-				.BorderBackgroundColor(FLinearColor(0.05f, 0.05f, 0.05f, 1.0f))
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
 				[
-					// Use selectable text widget so users can copy Python code
 					CreateSelectableTextWidget(
-						Code.TrimStartAndEnd(),
+						CodePreview,
 						FCoreStyle::GetDefaultFontStyle("Mono", 9),
 						FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
 						true /* bAutoWrap */
 					)
 				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 6.0f, 0.0f, 0.0f)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+					.OnClicked_Lambda([CodeSwitcher]() {
+						if (CodeSwitcher.IsValid())
+						{
+							CodeSwitcher->SetActiveWidgetIndex(1);
+						}
+						return FReply::Handled();
+					})
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(FString::Printf(TEXT("... Show %d more lines"), ExtraLines)))
+						.Font(GetUnrealGPTSmallBodyItalicFont())
+						.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+					]
+				]
 			];
+
+			// Slot 1: Expanded state (full code + "Show less" button)
+			CodeSwitcher->AddSlot()
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					CreateSelectableTextWidget(
+						Code,
+						FCoreStyle::GetDefaultFontStyle("Mono", 9),
+						FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
+						true /* bAutoWrap */
+					)
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 6.0f, 0.0f, 0.0f)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+					.OnClicked_Lambda([CodeSwitcher]() {
+						if (CodeSwitcher.IsValid())
+						{
+							CodeSwitcher->SetActiveWidgetIndex(0);
+						}
+						return FReply::Handled();
+					})
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(TEXT("Show less")))
+						.Font(GetUnrealGPTSmallBodyItalicFont())
+						.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+					]
+				]
+			];
+
+			ContentWidget = SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(STextBlock)
+					.Text(NSLOCTEXT("UnrealGPT", "PythonCode", "Script:"))
+					.Font(GetUnrealGPTSmallBodyFont())
+					.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f, 1.0f))
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				[
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+					.Padding(FMargin(8.0f))
+					.BorderBackgroundColor(FLinearColor(0.05f, 0.05f, 0.05f, 1.0f))
+					[
+						CodeSwitcher.ToSharedRef()
+					]
+				];
+		}
+		else
+		{
+			// Small script: show directly without expandable wrapper
+			ContentWidget = SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(STextBlock)
+					.Text(NSLOCTEXT("UnrealGPT", "PythonCode", "Script:"))
+					.Font(GetUnrealGPTSmallBodyFont())
+					.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f, 1.0f))
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				[
+					CodeContent
+				];
+		}
 	}
 	else if (ToolName == TEXT("scene_query"))
 	{
@@ -1105,11 +1224,11 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 	{
 		ToolColor = FLinearColor(0.8f, 0.6f, 0.2f, 1.0f); // Amber/Orange
 		ToolIcon = FString(TEXT("\xf02d")); // Book icon (documentation)
-		ToolDisplayName = TEXT("Documentation Search"); // Friendlier name
+		ToolDisplayName = TEXT("UE API Docs Search"); // Clearer name indicating it searches Unreal Engine documentation
 
-		// Parse the query from arguments (usually just "query" string)
+		// Parse the query from arguments
+		// OpenAI file_search_call uses "queries" (array) in Responses API
 		FString Query;
-		// Try simple string first if arguments is just a string (unlikely for tool args, but possible in some APIs)
 		if (!Arguments.StartsWith(TEXT("{")))
 		{
 			Query = Arguments;
@@ -1120,8 +1239,34 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Arguments);
 			if (FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid())
 			{
-				ArgsObj->TryGetStringField(TEXT("query"), Query);
+				// Try "queries" array first (OpenAI Responses API format)
+				const TArray<TSharedPtr<FJsonValue>>* QueriesArray = nullptr;
+				if (ArgsObj->TryGetArrayField(TEXT("queries"), QueriesArray) && QueriesArray && QueriesArray->Num() > 0)
+				{
+					// Join multiple queries with newlines
+					TArray<FString> QueryStrings;
+					for (const TSharedPtr<FJsonValue>& QueryVal : *QueriesArray)
+					{
+						FString QueryStr;
+						if (QueryVal.IsValid() && QueryVal->TryGetString(QueryStr) && !QueryStr.IsEmpty())
+						{
+							QueryStrings.Add(QueryStr);
+						}
+					}
+					Query = FString::Join(QueryStrings, TEXT("\n"));
+				}
+				// Fall back to singular "query" field
+				if (Query.IsEmpty())
+				{
+					ArgsObj->TryGetStringField(TEXT("query"), Query);
+				}
 			}
+		}
+
+		// Provide a fallback message if query is empty
+		if (Query.IsEmpty())
+		{
+			Query = TEXT("(query details not available)");
 		}
 
 		ContentWidget = SNew(SVerticalBox)
@@ -1129,7 +1274,7 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 			.AutoHeight()
 			[
 				SNew(STextBlock)
-				.Text(NSLOCTEXT("UnrealGPT", "FileSearchQuery", "Searching local docs for:"))
+				.Text(NSLOCTEXT("UnrealGPT", "FileSearchQuery", "Searching UE Python API docs for:"))
 				.Font(GetUnrealGPTSmallBodyFont())
 				.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f, 1.0f))
 			]
@@ -1590,12 +1735,34 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 
 	// Check if this is a base64-encoded screenshot (PNG or JPEG)
 	bool bIsScreenshot = false;
+	FString ImageBase64;  // Will hold the actual base64 image data for display
+	FString ScreenshotMetadata;  // Will hold metadata JSON if present
+
 	// PNG base64 header: iVBORw0KGgo
 	// JPEG base64 header: /9j/4AAQSkZJRg (standard JFIF) or /9j/4 (other JPEG variants)
-	if (Trimmed.Len() > 100 &&
+
+	// First check for the new format with metadata: {metadata}\n__IMAGE_BASE64__\n{base64}
+	static const FString ImageSeparator = TEXT("\n__IMAGE_BASE64__\n");
+	int32 SeparatorIndex = Trimmed.Find(ImageSeparator);
+	if (SeparatorIndex != INDEX_NONE)
+	{
+		// New format: metadata + separator + base64 image
+		ScreenshotMetadata = Trimmed.Left(SeparatorIndex);
+		ImageBase64 = Trimmed.Mid(SeparatorIndex + ImageSeparator.Len());
+
+		// Verify the extracted data looks like a valid base64 image
+		if (ImageBase64.Len() > 100 &&
+			(ImageBase64.StartsWith(TEXT("iVBORw0KGgo")) || ImageBase64.StartsWith(TEXT("/9j/"))))
+		{
+			bIsScreenshot = true;
+		}
+	}
+	// Legacy format: raw base64 image (no metadata)
+	else if (Trimmed.Len() > 100 &&
 		(Trimmed.StartsWith(TEXT("iVBORw0KGgo")) || Trimmed.StartsWith(TEXT("/9j/"))))
 	{
 		bIsScreenshot = true;
+		ImageBase64 = Trimmed;
 	}
 
 	// Try to generate a friendlier summary for JSON array results (e.g., scene_query)
@@ -1711,9 +1878,9 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 		// Handle screenshot display specially
 		if (bIsScreenshot)
 		{
-			// Decode base64 and create texture
+			// Decode base64 and create texture (use ImageBase64 which has the actual image data)
 			TArray<uint8> ImageData;
-			if (FBase64::Decode(Trimmed, ImageData))
+			if (FBase64::Decode(ImageBase64, ImageData))
 			{
 				IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
 
@@ -1841,6 +2008,126 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 			DisplayText = TEXT("Screenshot captured (failed to decode image for display)");
 		}
 		
+		// Determine if content is large enough to warrant collapsible display
+		TArray<FString> ResultLines;
+		DisplayText.ParseIntoArrayLines(ResultLines);
+		const int32 ResultLineCount = ResultLines.Num();
+		const int32 MaxResultLines = 10;
+		const int32 MaxResultChars = 1000;
+		const bool bNeedsCollapsible = (ResultLineCount > MaxResultLines) || (DisplayText.Len() > MaxResultChars);
+
+		// Build preview for collapsed state
+		FString ResultPreview;
+		if (bNeedsCollapsible)
+		{
+			const int32 PreviewLines = FMath::Min(MaxResultLines, ResultLineCount);
+			for (int32 i = 0; i < PreviewLines; ++i)
+			{
+				ResultPreview += ResultLines[i] + TEXT("\n");
+			}
+			ResultPreview = ResultPreview.TrimEnd();
+			if (ResultPreview.Len() > MaxResultChars)
+			{
+				ResultPreview = ResultPreview.Left(MaxResultChars);
+			}
+		}
+
+		// Create the result display (either direct or collapsible)
+		TSharedRef<SWidget> ResultDisplay = SNullWidget::NullWidget;
+
+		if (bNeedsCollapsible)
+		{
+			// Use widget switcher for clean expand/collapse without persistent header
+			TSharedPtr<SWidgetSwitcher> ResultSwitcher = SNew(SWidgetSwitcher)
+				.WidgetIndex(0); // Start collapsed
+
+			const int32 ExtraResultLines = ResultLineCount - FMath::Min(MaxResultLines, ResultLineCount);
+			FSlateFontInfo ResultFont = bIsSceneQueryResult ? GetUnrealGPTBodyFont() : FCoreStyle::GetDefaultFontStyle("Mono", 8);
+
+			// Slot 0: Collapsed state (preview + "Show more" button)
+			ResultSwitcher->AddSlot()
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					CreateSelectableTextWidget(
+						ResultPreview,
+						ResultFont,
+						FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
+						true /* bAutoWrap */
+					)
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 6.0f, 0.0f, 0.0f)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+					.OnClicked_Lambda([ResultSwitcher]() {
+						if (ResultSwitcher.IsValid())
+						{
+							ResultSwitcher->SetActiveWidgetIndex(1);
+						}
+						return FReply::Handled();
+					})
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(FString::Printf(TEXT("... Show %d more lines"), ExtraResultLines)))
+						.Font(GetUnrealGPTSmallBodyItalicFont())
+						.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+					]
+				]
+			];
+
+			// Slot 1: Expanded state (full content + "Show less" button)
+			ResultSwitcher->AddSlot()
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					CreateSelectableTextWidget(
+						DisplayText,
+						ResultFont,
+						FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
+						true /* bAutoWrap */
+					)
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 6.0f, 0.0f, 0.0f)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+					.OnClicked_Lambda([ResultSwitcher]() {
+						if (ResultSwitcher.IsValid())
+						{
+							ResultSwitcher->SetActiveWidgetIndex(0);
+						}
+						return FReply::Handled();
+					})
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(TEXT("Show less")))
+						.Font(GetUnrealGPTSmallBodyItalicFont())
+						.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+					]
+				]
+			];
+
+			ResultDisplay = ResultSwitcher.ToSharedRef();
+		}
+		else
+		{
+			ResultDisplay = CreateSelectableTextWidget(
+				DisplayText,
+				bIsSceneQueryResult ? GetUnrealGPTBodyFont() : FCoreStyle::GetDefaultFontStyle("Mono", 8),
+				FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
+				true /* bAutoWrap */
+			);
+		}
+
 		// Standard tool result display
 		ChatHistoryBox->AddSlot()
 			.Padding(12.0f, 6.0f)
@@ -1851,7 +2138,7 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 				.Padding(FMargin(14.0f, 10.0f))
 				[
 					SNew(SHorizontalBox)
-					
+
 					// Result icon
 					+ SHorizontalBox::Slot()
 					.AutoWidth()
@@ -1863,7 +2150,7 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 						[
 							SNew(SBorder)
 							.BorderImage(FAppStyle::GetBrush("Brushes.White"))
-							.BorderBackgroundColor(bIsSceneQueryResult ? FLinearColor(0.6f, 0.4f, 0.9f, 1.0f) : 
+							.BorderBackgroundColor(bIsSceneQueryResult ? FLinearColor(0.6f, 0.4f, 0.9f, 1.0f) :
 								(bIsScreenshot ? FLinearColor(0.3f, 0.8f, 0.6f, 1.0f) : FLinearColor(0.3f, 0.7f, 0.3f, 1.0f)))
 							.Padding(0.0f)
 							.HAlign(HAlign_Center)
@@ -1876,13 +2163,13 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 							]
 						]
 					]
-					
+
 					// Result content
 					+ SHorizontalBox::Slot()
 					.FillWidth(1.0f)
 					[
 						SNew(SVerticalBox)
-						
+
 						+ SVerticalBox::Slot()
 						.AutoHeight()
 						.Padding(0.0f, 0.0f, 0.0f, 6.0f)
@@ -1892,17 +2179,11 @@ void SUnrealGPTWidget::HandleToolResult(const FString& ToolCallId, const FString
 							.Font(GetUnrealGPTSmallBodyFont())
 							.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f, 1.0f))
 						]
-						
+
 						+ SVerticalBox::Slot()
 						.AutoHeight()
 						[
-							// Use selectable text widget so users can copy tool results
-							CreateSelectableTextWidget(
-								DisplayText,
-								bIsSceneQueryResult ? GetUnrealGPTBodyFont() : FCoreStyle::GetDefaultFontStyle("Mono", 8),
-								FLinearColor(0.9f, 0.9f, 0.9f, 1.0f),
-								true /* bAutoWrap */
-							)
+							ResultDisplay
 						]
 					]
 				]
