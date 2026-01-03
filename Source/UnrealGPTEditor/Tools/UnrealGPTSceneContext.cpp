@@ -524,7 +524,18 @@ FString UUnrealGPTSceneContext::QueryScene(const FString& ArgumentsJson)
 	UWorld* World = GEditor->GetEditorWorldContext().World();
 	if (!World)
 	{
-		return TEXT("[]");
+		TSharedPtr<FJsonObject> ErrorResult = MakeShareable(new FJsonObject);
+		TSharedPtr<FJsonObject> SummaryObj = MakeShareable(new FJsonObject);
+		SummaryObj->SetNumberField(TEXT("total_matched"), 0);
+		SummaryObj->SetNumberField(TEXT("returned"), 0);
+		SummaryObj->SetBoolField(TEXT("has_more"), false);
+		ErrorResult->SetObjectField(TEXT("summary"), SummaryObj);
+		ErrorResult->SetArrayField(TEXT("actors"), TArray<TSharedPtr<FJsonValue>>());
+
+		FString OutputString;
+		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+		FJsonSerializer::Serialize(ErrorResult.ToSharedRef(), Writer);
+		return OutputString;
 	}
 
 	// Parse arguments JSON
@@ -555,30 +566,42 @@ FString UUnrealGPTSceneContext::QueryScene(const FString& ArgumentsJson)
 		return Value;
 	};
 
-	auto GetBoolArg = [&ArgsObj](const FString& Key, bool DefaultValue) -> bool
-	{
-		bool Value = DefaultValue;
-		if (ArgsObj.IsValid())
-		{
-			ArgsObj->TryGetBoolField(Key, Value);
-		}
-		return Value;
-	};
-
 	// Filter parameters
 	const FString ClassContains = GetStringArg(TEXT("class_contains"));
 	const FString LabelContains = GetStringArg(TEXT("label_contains"));
 	const FString NameContains = GetStringArg(TEXT("name_contains"));
 	const FString ComponentClassContains = GetStringArg(TEXT("component_class_contains"));
 	const int32 MaxResults = FMath::Max(1, GetIntArg(TEXT("max_results"), 20));
+	const int32 Offset = FMath::Max(0, GetIntArg(TEXT("offset"), 0));
 
-	// Optional include flags (off by default to keep payload small)
-	const bool bIncludeTransform = GetBoolArg(TEXT("include_transform"), false);
-	const bool bIncludeBounds = GetBoolArg(TEXT("include_bounds"), false);
-	const bool bIncludeComponents = GetBoolArg(TEXT("include_components"), false);
-	const bool bIncludeMetadata = GetBoolArg(TEXT("include_metadata"), false);
+	// Parse 'fields' parameter - comma-separated list of field names
+	const FString FieldsStr = GetStringArg(TEXT("fields"));
+	TSet<FString> RequestedFields;
+	if (!FieldsStr.IsEmpty())
+	{
+		TArray<FString> FieldParts;
+		FieldsStr.ParseIntoArray(FieldParts, TEXT(","), true);
+		for (FString& Part : FieldParts)
+		{
+			Part.TrimStartAndEndInline();
+			Part.ToLowerInline();
+			RequestedFields.Add(Part);
+		}
+	}
 
-	TArray<TSharedPtr<FJsonValue>> ResultsArray;
+	// Check which fields are requested
+	const bool bIncludeLocation = RequestedFields.Contains(TEXT("location"));
+	const bool bIncludeRotation = RequestedFields.Contains(TEXT("rotation"));
+	const bool bIncludeScale = RequestedFields.Contains(TEXT("scale"));
+	const bool bIncludeBounds = RequestedFields.Contains(TEXT("bounds"));
+	const bool bIncludeComponents = RequestedFields.Contains(TEXT("components"));
+	const bool bIncludeTags = RequestedFields.Contains(TEXT("tags"));
+	const bool bIncludeFolder = RequestedFields.Contains(TEXT("folder"));
+	const bool bIncludeParent = RequestedFields.Contains(TEXT("parent"));
+
+	// First pass: collect all matching actors and count classes
+	TArray<AActor*> MatchingActors;
+	TMap<FString, int32> ClassCounts;
 
 	for (TActorIterator<AActor> ActorItr(World); ActorItr; ++ActorItr)
 	{
@@ -632,22 +655,47 @@ FString UUnrealGPTSceneContext::QueryScene(const FString& ArgumentsJson)
 			}
 		}
 
-		// Build JSON object for this actor
+		// Actor matches all filters
+		MatchingActors.Add(Actor);
+
+		// Count class occurrences for summary
+		int32& Count = ClassCounts.FindOrAdd(ClassName);
+		Count++;
+	}
+
+	const int32 TotalMatched = MatchingActors.Num();
+
+	// Second pass: build results for the requested page
+	TArray<TSharedPtr<FJsonValue>> ResultsArray;
+	const int32 StartIndex = FMath::Min(Offset, TotalMatched);
+	const int32 EndIndex = FMath::Min(Offset + MaxResults, TotalMatched);
+
+	for (int32 i = StartIndex; i < EndIndex; ++i)
+	{
+		AActor* Actor = MatchingActors[i];
+		const FString ClassName = Actor->GetClass()->GetName();
+		const FString Label = Actor->GetActorLabel();
+		const FString Id = Actor->GetName(); // Internal name is the stable unique identifier
+
+		// Build JSON object for this actor - minimal by default
 		TSharedPtr<FJsonObject> ActorJson = MakeShareable(new FJsonObject);
-		ActorJson->SetStringField(TEXT("name"), Name);
-		ActorJson->SetStringField(TEXT("label"), Label);
+		ActorJson->SetStringField(TEXT("id"), Id);       // Stable unique identifier
+		ActorJson->SetStringField(TEXT("label"), Label); // User-friendly display name
 		ActorJson->SetStringField(TEXT("class"), ClassName);
 
-		// Always include location
-		const FVector Location = Actor->GetActorLocation();
-		TSharedPtr<FJsonObject> LocationJson = MakeShareable(new FJsonObject);
-		LocationJson->SetNumberField(TEXT("x"), Location.X);
-		LocationJson->SetNumberField(TEXT("y"), Location.Y);
-		LocationJson->SetNumberField(TEXT("z"), Location.Z);
-		ActorJson->SetObjectField(TEXT("location"), LocationJson);
+		// Optional: location
+		if (bIncludeLocation)
+		{
+			const FVector Location = Actor->GetActorLocation();
+			TSharedPtr<FJsonObject> LocationJson = MakeShareable(new FJsonObject);
+			LocationJson->SetNumberField(TEXT("x"), Location.X);
+			LocationJson->SetNumberField(TEXT("y"), Location.Y);
+			LocationJson->SetNumberField(TEXT("z"), Location.Z);
+			ActorJson->SetObjectField(TEXT("location"), LocationJson);
+		}
 
-		// Optional: full transform (rotation + scale)
-		if (bIncludeTransform)
+		// Optional: rotation
+		if (bIncludeRotation)
 		{
 			const FRotator Rotation = Actor->GetActorRotation();
 			TSharedPtr<FJsonObject> RotationJson = MakeShareable(new FJsonObject);
@@ -655,7 +703,11 @@ FString UUnrealGPTSceneContext::QueryScene(const FString& ArgumentsJson)
 			RotationJson->SetNumberField(TEXT("yaw"), Rotation.Yaw);
 			RotationJson->SetNumberField(TEXT("roll"), Rotation.Roll);
 			ActorJson->SetObjectField(TEXT("rotation"), RotationJson);
+		}
 
+		// Optional: scale
+		if (bIncludeScale)
+		{
 			const FVector Scale = Actor->GetActorScale3D();
 			TSharedPtr<FJsonObject> ScaleJson = MakeShareable(new FJsonObject);
 			ScaleJson->SetNumberField(TEXT("x"), Scale.X);
@@ -725,21 +777,26 @@ FString UUnrealGPTSceneContext::QueryScene(const FString& ArgumentsJson)
 			}
 		}
 
-		// Optional: metadata (tags, folder, parent)
-		if (bIncludeMetadata)
+		// Optional: tags
+		if (bIncludeTags)
 		{
-			// Tags
 			TArray<TSharedPtr<FJsonValue>> TagsArray;
 			for (const FName& Tag : Actor->Tags)
 			{
 				TagsArray.Add(MakeShareable(new FJsonValueString(Tag.ToString())));
 			}
 			ActorJson->SetArrayField(TEXT("tags"), TagsArray);
+		}
 
-			// Folder path
+		// Optional: folder path
+		if (bIncludeFolder)
+		{
 			ActorJson->SetStringField(TEXT("folder_path"), Actor->GetFolderPath().ToString());
+		}
 
-			// Parent attachment
+		// Optional: parent attachment
+		if (bIncludeParent)
+		{
 			if (AActor* ParentActor = Actor->GetAttachParentActor())
 			{
 				ActorJson->SetStringField(TEXT("parent_actor"), ParentActor->GetActorLabel());
@@ -747,16 +804,35 @@ FString UUnrealGPTSceneContext::QueryScene(const FString& ArgumentsJson)
 		}
 
 		ResultsArray.Add(MakeShareable(new FJsonValueObject(ActorJson)));
-
-		if (ResultsArray.Num() >= MaxResults)
-		{
-			break;
-		}
 	}
+
+	// Build top_classes array (sorted by count, top 5)
+	ClassCounts.ValueSort([](int32 A, int32 B) { return A > B; });
+	TArray<TSharedPtr<FJsonValue>> TopClassesArray;
+	int32 ClassIndex = 0;
+	for (const auto& Pair : ClassCounts)
+	{
+		if (ClassIndex >= 5) break;
+		TopClassesArray.Add(MakeShareable(new FJsonValueString(FString::Printf(TEXT("%s (%d)"), *Pair.Key, Pair.Value))));
+		ClassIndex++;
+	}
+
+	// Build summary object
+	TSharedPtr<FJsonObject> SummaryObj = MakeShareable(new FJsonObject);
+	SummaryObj->SetNumberField(TEXT("total_matched"), TotalMatched);
+	SummaryObj->SetNumberField(TEXT("returned"), ResultsArray.Num());
+	SummaryObj->SetNumberField(TEXT("offset"), Offset);
+	SummaryObj->SetBoolField(TEXT("has_more"), EndIndex < TotalMatched);
+	SummaryObj->SetArrayField(TEXT("top_classes"), TopClassesArray);
+
+	// Build final result object
+	TSharedPtr<FJsonObject> ResultObj = MakeShareable(new FJsonObject);
+	ResultObj->SetObjectField(TEXT("summary"), SummaryObj);
+	ResultObj->SetArrayField(TEXT("actors"), ResultsArray);
 
 	FString OutputString;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-	FJsonSerializer::Serialize(ResultsArray, Writer);
+	FJsonSerializer::Serialize(ResultObj.ToSharedRef(), Writer);
 	return OutputString;
 }
 

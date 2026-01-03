@@ -51,13 +51,26 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 	{
 		FToolSchema SceneQuerySchema(TEXT("scene_query"),
 			TEXT("Search the current level for actors matching simple filters.\n\n")
-			TEXT("By default returns compact results: {name, label, class, location}.\n")
-			TEXT("Use optional include_* flags to add more detail (increases payload size):\n")
-			TEXT("- include_transform: adds rotation {pitch,yaw,roll} and scale {x,y,z}\n")
-			TEXT("- include_bounds: adds bounds {origin, extent}\n")
-			TEXT("- include_components: adds root_component {class, mobility}, static_mesh_path\n")
-			TEXT("- include_metadata: adds tags[], folder_path, parent_actor\n\n")
-			TEXT("Results are displayed to the user as a formatted list for easy reference in python_execute calls."));
+			TEXT("Returns a summary object with pagination info and an actors array:\n")
+			TEXT("{\n")
+			TEXT("  \"summary\": { \"total_matched\": 47, \"returned\": 20, \"has_more\": true, \"offset\": 0, \"top_classes\": [...] },\n")
+			TEXT("  \"actors\": [ { \"id\": \"StaticMeshActor_42\", \"label\": \"Bridge\", \"class\": \"...\" }, ... ]\n")
+			TEXT("}\n\n")
+			TEXT("Each actor returns:\n")
+			TEXT("- id: stable unique identifier (use this for subsequent tool calls)\n")
+			TEXT("- label: user-friendly display name (may have duplicates)\n")
+			TEXT("- class: actor class name\n\n")
+			TEXT("Use the 'fields' parameter to request additional data (comma-separated):\n")
+			TEXT("- location: actor world position {x,y,z}\n")
+			TEXT("- rotation: actor rotation {pitch,yaw,roll}\n")
+			TEXT("- scale: actor scale {x,y,z}\n")
+			TEXT("- bounds: bounding box {origin, extent}\n")
+			TEXT("- components: root_component info and static_mesh_path\n")
+			TEXT("- tags: actor tags array\n")
+			TEXT("- folder: folder path in outliner\n")
+			TEXT("- parent: parent actor if attached\n\n")
+			TEXT("Example: fields=\"location,rotation\" or fields=\"location,bounds,tags\"\n\n")
+			TEXT("IMPORTANT: Use the returned 'id' field for subsequent operations to avoid label collisions."));
 		SceneQuerySchema.AddParam(FToolParameter::String(TEXT("class_contains"),
 			TEXT("Optional substring to match in actor class names, e.g., 'DirectionalLight', 'StaticMeshActor'.")));
 		SceneQuerySchema.AddParam(FToolParameter::String(TEXT("label_contains"),
@@ -68,14 +81,10 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 			TEXT("Optional substring to match in component class names, e.g., 'DirectionalLightComponent'.")));
 		SceneQuerySchema.AddParam(FToolParameter::Integer(TEXT("max_results"),
 			TEXT("Maximum number of matching actors to return (default 20).")));
-		SceneQuerySchema.AddParam(FToolParameter::Boolean(TEXT("include_transform"),
-			TEXT("Include full transform (rotation, scale) in addition to location. Default false.")));
-		SceneQuerySchema.AddParam(FToolParameter::Boolean(TEXT("include_bounds"),
-			TEXT("Include bounding box (origin, extent). Default false.")));
-		SceneQuerySchema.AddParam(FToolParameter::Boolean(TEXT("include_components"),
-			TEXT("Include root component info (class, mobility) and static mesh asset paths. Default false.")));
-		SceneQuerySchema.AddParam(FToolParameter::Boolean(TEXT("include_metadata"),
-			TEXT("Include tags, folder path, and parent attachment info. Default false.")));
+		SceneQuerySchema.AddParam(FToolParameter::Integer(TEXT("offset"),
+			TEXT("Number of matching actors to skip for pagination (default 0).")));
+		SceneQuerySchema.AddParam(FToolParameter::String(TEXT("fields"),
+			TEXT("Comma-separated list of additional fields to include: location,rotation,scale,bounds,components,tags,folder,parent. Default: none (minimal output).")));
 		Schemas.Add(SceneQuerySchema);
 	}
 
@@ -117,12 +126,16 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 	// get_actor
 	{
 		FToolSchema GetActorSchema(TEXT("get_actor"),
-			TEXT("Get detailed information about a specific actor by label or name.\n\n")
+			TEXT("Get detailed information about a specific actor.\n\n")
+			TEXT("Accepts 'id' (stable internal name, preferred) or 'label' (display name).\n")
+			TEXT("Use 'id' when you need guaranteed unique matching (e.g., from scene_query results).\n\n")
 			TEXT("Returns JSON with transform, bounds, class, components, and more:\n")
 			TEXT("{\n")
 			TEXT("  \"status\": \"ok\",\n")
 			TEXT("  \"actor\": {\n")
-			TEXT("    \"name\": \"...\", \"label\": \"...\", \"class\": \"...\",\n")
+			TEXT("    \"id\": \"StaticMeshActor_42\",  // stable unique identifier\n")
+			TEXT("    \"label\": \"Bridge_Deck\",      // user-friendly display name\n")
+			TEXT("    \"class\": \"...\",\n")
 			TEXT("    \"location\": {...}, \"rotation\": {...}, \"scale\": {...},\n")
 			TEXT("    \"bounds\": {\"origin\": {...}, \"extent\": {...}},\n")
 			TEXT("    \"mobility\": \"Static|Stationary|Movable\",\n")
@@ -130,10 +143,10 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 			TEXT("    \"tags\": [...], \"folder_path\": \"...\"\n")
 			TEXT("  }\n")
 			TEXT("}"));
+		GetActorSchema.AddParam(FToolParameter::String(TEXT("id"),
+			TEXT("Actor id (internal name from scene_query). Preferred - guaranteed unique.")));
 		GetActorSchema.AddParam(FToolParameter::String(TEXT("label"),
-			TEXT("Actor label (as shown in Outliner) to find.")));
-		GetActorSchema.AddParam(FToolParameter::String(TEXT("name"),
-			TEXT("Actor object name (internal name) to find. Use label OR name, not both.")));
+			TEXT("Actor label (as shown in Outliner). Fallback if id not provided.")));
 		Schemas.Add(GetActorSchema);
 	}
 
@@ -141,9 +154,12 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 	{
 		FToolSchema SetTransformSchema(TEXT("set_actor_transform"),
 			TEXT("Set an actor's transform (location, rotation, scale). Only provided fields are changed.\n\n")
-			TEXT("Returns the new transform after modification. Wrapped in an Editor transaction for Undo."));
+			TEXT("Accepts 'id' (stable, preferred) or 'label' (display name).\n")
+			TEXT("Returns the new transform with actor id/label. Wrapped in an Editor transaction for Undo."));
+		SetTransformSchema.AddParam(FToolParameter::String(TEXT("id"),
+			TEXT("Actor id (internal name). Preferred - guaranteed unique.")));
 		SetTransformSchema.AddParam(FToolParameter::String(TEXT("label"),
-			TEXT("Actor label to modify."), true));
+			TEXT("Actor label (Outliner name). Fallback if id not provided.")));
 		SetTransformSchema.AddParam(FToolParameter::Object(TEXT("location"),
 			TEXT("New location {x, y, z}. Omit to keep current.")));
 		SetTransformSchema.AddParam(FToolParameter::Object(TEXT("rotation"),
@@ -158,10 +174,13 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 	// select_actors
 	{
 		FToolSchema SelectSchema(TEXT("select_actors"),
-			TEXT("Select one or more actors by their labels.\n\n")
-			TEXT("Returns the list of actors that were successfully selected."));
+			TEXT("Select one or more actors.\n\n")
+			TEXT("Accepts 'ids' array (preferred) or 'labels' array (backwards compatible).\n")
+			TEXT("Returns selected actors with both id and label for each."));
+		SelectSchema.AddParam(FToolParameter::StringArray(TEXT("ids"),
+			TEXT("Array of actor ids (internal names). Preferred - guaranteed unique.")));
 		SelectSchema.AddParam(FToolParameter::StringArray(TEXT("labels"),
-			TEXT("Array of actor labels to select."), true));
+			TEXT("Array of actor labels. Fallback if ids not provided.")));
 		SelectSchema.AddParam(FToolParameter::Boolean(TEXT("add_to_selection"),
 			TEXT("If true, add to current selection. If false (default), replace selection.")));
 		Schemas.Add(SelectSchema);
@@ -171,9 +190,12 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 	{
 		FToolSchema DuplicateSchema(TEXT("duplicate_actor"),
 			TEXT("Duplicate an actor one or more times with optional offset between copies.\n\n")
-			TEXT("Returns list of created actor labels. Wrapped in an Editor transaction for Undo."));
+			TEXT("Accepts 'id' (preferred) or 'label' to identify the source actor.\n")
+			TEXT("Returns created actors with both id and label. Wrapped in an Editor transaction for Undo."));
+		DuplicateSchema.AddParam(FToolParameter::String(TEXT("id"),
+			TEXT("Actor id (internal name) to duplicate. Preferred - guaranteed unique.")));
 		DuplicateSchema.AddParam(FToolParameter::String(TEXT("label"),
-			TEXT("Actor label to duplicate."), true));
+			TEXT("Actor label to duplicate. Fallback if id not provided.")));
 		DuplicateSchema.AddParam(FToolParameter::Integer(TEXT("count"),
 			TEXT("Number of copies to create. Default 1.")));
 		DuplicateSchema.AddParam(FToolParameter::Object(TEXT("offset"),
@@ -185,9 +207,12 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 	{
 		FToolSchema SnapSchema(TEXT("snap_actor_to_ground"),
 			TEXT("Snap an actor to the ground/surface below it using a line trace.\n\n")
-			TEXT("Returns the new location after snapping. Wrapped in an Editor transaction for Undo."));
+			TEXT("Accepts 'id' (preferred) or 'label' to identify the actor.\n")
+			TEXT("Returns the new location with actor id/label. Wrapped in an Editor transaction for Undo."));
+		SnapSchema.AddParam(FToolParameter::String(TEXT("id"),
+			TEXT("Actor id (internal name). Preferred - guaranteed unique.")));
 		SnapSchema.AddParam(FToolParameter::String(TEXT("label"),
-			TEXT("Actor label to snap to ground."), true));
+			TEXT("Actor label. Fallback if id not provided.")));
 		SnapSchema.AddParam(FToolParameter::Boolean(TEXT("align_to_normal"),
 			TEXT("If true, align actor rotation to surface normal. Default false.")));
 		SnapSchema.AddParam(FToolParameter::Number(TEXT("offset"),
@@ -199,9 +224,12 @@ TArray<FToolSchema> UnrealGPTToolSchemas::GetStandardToolSchemas(bool bEnablePyt
 	{
 		FToolSchema BatchRotationSchema(TEXT("set_actors_rotation"),
 			TEXT("Set rotation on multiple actors at once. Efficient for batch rotation updates.\n\n")
-			TEXT("Returns the count of successfully modified actors. Wrapped in an Editor transaction for Undo."));
+			TEXT("Accepts 'ids' array (preferred) or 'labels' array (backwards compatible).\n")
+			TEXT("Returns modified actors with both id and label. Wrapped in an Editor transaction for Undo."));
+		BatchRotationSchema.AddParam(FToolParameter::StringArray(TEXT("ids"),
+			TEXT("Array of actor ids (internal names). Preferred - guaranteed unique.")));
 		BatchRotationSchema.AddParam(FToolParameter::StringArray(TEXT("labels"),
-			TEXT("Array of actor labels to modify."), true));
+			TEXT("Array of actor labels. Fallback if ids not provided.")));
 		BatchRotationSchema.AddParam(FToolParameter::Object(TEXT("rotation"),
 			TEXT("New rotation {pitch, yaw, roll} in degrees to apply to all actors."), true));
 		BatchRotationSchema.AddParam(FToolParameter::Boolean(TEXT("relative"),

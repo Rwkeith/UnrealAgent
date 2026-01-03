@@ -273,7 +273,7 @@ FString UUnrealGPTToolExecutor::GetSceneSummary(int32 PageSize)
 
 // ==================== HELPERS ====================
 
-AActor* UUnrealGPTToolExecutor::FindActorByLabelOrName(const FString& Label, const FString& Name)
+AActor* UUnrealGPTToolExecutor::FindActorByIdOrLabel(const FString& Id, const FString& Label)
 {
 	if (!GEditor)
 	{
@@ -286,6 +286,26 @@ AActor* UUnrealGPTToolExecutor::FindActorByLabelOrName(const FString& Label, con
 		return nullptr;
 	}
 
+	// Priority: Id (internal name) first, then Label
+	// Id is the stable internal name (Actor->GetName()), guaranteed unique within a level
+	// Label is the user-friendly display name (Actor->GetActorLabel()), may have duplicates
+
+	for (TActorIterator<AActor> ActorItr(World); ActorItr; ++ActorItr)
+	{
+		AActor* Actor = *ActorItr;
+		if (!Actor || Actor->IsPendingKillPending())
+		{
+			continue;
+		}
+
+		// Check Id first (exact match on internal name) - this is the stable identifier
+		if (!Id.IsEmpty() && Actor->GetName() == Id)
+		{
+			return Actor;
+		}
+	}
+
+	// If no Id match, fall back to Label search
 	for (TActorIterator<AActor> ActorItr(World); ActorItr; ++ActorItr)
 	{
 		AActor* Actor = *ActorItr;
@@ -298,13 +318,16 @@ AActor* UUnrealGPTToolExecutor::FindActorByLabelOrName(const FString& Label, con
 		{
 			return Actor;
 		}
-		if (!Name.IsEmpty() && Actor->GetName() == Name)
-		{
-			return Actor;
-		}
 	}
 
 	return nullptr;
+}
+
+// Legacy wrapper for backwards compatibility
+AActor* UUnrealGPTToolExecutor::FindActorByLabelOrName(const FString& Label, const FString& Name)
+{
+	// Name parameter was the internal name, which is now called Id
+	return FindActorByIdOrLabel(Name, Label);
 }
 
 void UUnrealGPTToolExecutor::FocusViewportOnCreatedAsset(const FString& ResultJson)
@@ -401,20 +424,20 @@ FString UUnrealGPTToolExecutor::ExecuteGetActor(const FString& ArgumentsJson)
 		return TEXT("{\"status\":\"error\",\"message\":\"Failed to parse get_actor arguments\"}");
 	}
 
-	FString Label, Name;
+	FString Id, Label;
+	ArgsObj->TryGetStringField(TEXT("id"), Id);
 	ArgsObj->TryGetStringField(TEXT("label"), Label);
-	ArgsObj->TryGetStringField(TEXT("name"), Name);
 
-	if (Label.IsEmpty() && Name.IsEmpty())
+	if (Id.IsEmpty() && Label.IsEmpty())
 	{
-		return TEXT("{\"status\":\"error\",\"message\":\"Must provide 'label' or 'name'\"}");
+		return TEXT("{\"status\":\"error\",\"message\":\"Must provide 'id' or 'label'\"}");
 	}
 
-	AActor* Actor = FindActorByLabelOrName(Label, Name);
+	AActor* Actor = FindActorByIdOrLabel(Id, Label);
 	if (!Actor)
 	{
 		return FString::Printf(TEXT("{\"status\":\"error\",\"message\":\"Actor not found: %s\"}"),
-			!Label.IsEmpty() ? *Label : *Name);
+			!Id.IsEmpty() ? *Id : *Label);
 	}
 
 	// Build detailed actor info
@@ -422,8 +445,8 @@ FString UUnrealGPTToolExecutor::ExecuteGetActor(const FString& ArgumentsJson)
 	ResultObj->SetStringField(TEXT("status"), TEXT("ok"));
 
 	TSharedPtr<FJsonObject> ActorObj = MakeShareable(new FJsonObject);
-	ActorObj->SetStringField(TEXT("name"), Actor->GetName());
-	ActorObj->SetStringField(TEXT("label"), Actor->GetActorLabel());
+	ActorObj->SetStringField(TEXT("id"), Actor->GetName());       // Stable unique identifier
+	ActorObj->SetStringField(TEXT("label"), Actor->GetActorLabel()); // User-friendly display name
 	ActorObj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
 
 	// Location
@@ -504,16 +527,19 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorTransform(const FString& Argument
 		return MakeErrorResult(TEXT("Failed to parse set_actor_transform arguments"));
 	}
 
-	FString Label;
-	if (!ArgsObj->TryGetStringField(TEXT("label"), Label) || Label.IsEmpty())
+	FString Id, Label;
+	ArgsObj->TryGetStringField(TEXT("id"), Id);
+	ArgsObj->TryGetStringField(TEXT("label"), Label);
+
+	if (Id.IsEmpty() && Label.IsEmpty())
 	{
-		return MakeErrorResult(TEXT("Missing required field: label"));
+		return MakeErrorResult(TEXT("Must provide 'id' or 'label'"));
 	}
 
-	AActor* Actor = FindActorByLabelOrName(Label, TEXT(""));
+	AActor* Actor = FindActorByIdOrLabel(Id, Label);
 	if (!Actor)
 	{
-		return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), *Label));
+		return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), !Id.IsEmpty() ? *Id : *Label));
 	}
 
 	// Begin transaction for undo support
@@ -575,9 +601,11 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorTransform(const FString& Argument
 	NewTransform->SetObjectField(TEXT("scale"), MakeVectorJson(Scale));
 
 	TSharedPtr<FJsonObject> Details = MakeShareable(new FJsonObject);
+	Details->SetStringField(TEXT("id"), Actor->GetName());
+	Details->SetStringField(TEXT("label"), Actor->GetActorLabel());
 	Details->SetObjectField(TEXT("transform"), NewTransform);
 
-	return MakeSuccessResult(FString::Printf(TEXT("Transform updated for %s"), *Label), Details);
+	return MakeSuccessResult(FString::Printf(TEXT("Transform updated for %s"), *Actor->GetActorLabel()), Details);
 }
 
 FString UUnrealGPTToolExecutor::ExecuteSelectActors(const FString& ArgumentsJson)
@@ -589,10 +617,15 @@ FString UUnrealGPTToolExecutor::ExecuteSelectActors(const FString& ArgumentsJson
 		return TEXT("{\"status\":\"error\",\"message\":\"Failed to parse select_actors arguments\"}");
 	}
 
+	// Support both 'ids' (preferred) and 'labels' (backwards compatible)
+	const TArray<TSharedPtr<FJsonValue>>* IdsArray = nullptr;
 	const TArray<TSharedPtr<FJsonValue>>* LabelsArray = nullptr;
-	if (!ArgsObj->TryGetArrayField(TEXT("labels"), LabelsArray) || !LabelsArray)
+	ArgsObj->TryGetArrayField(TEXT("ids"), IdsArray);
+	ArgsObj->TryGetArrayField(TEXT("labels"), LabelsArray);
+
+	if ((!IdsArray || IdsArray->Num() == 0) && (!LabelsArray || LabelsArray->Num() == 0))
 	{
-		return TEXT("{\"status\":\"error\",\"message\":\"Missing required field: labels (array)\"}");
+		return TEXT("{\"status\":\"error\",\"message\":\"Must provide 'ids' or 'labels' array\"}");
 	}
 
 	bool bAddToSelection = false;
@@ -603,46 +636,79 @@ FString UUnrealGPTToolExecutor::ExecuteSelectActors(const FString& ArgumentsJson
 		GEditor->SelectNone(false, true);
 	}
 
-	TArray<FString> SelectedLabels;
-	TArray<FString> NotFoundLabels;
+	// Track selected actors with both id and label
+	TArray<TPair<FString, FString>> SelectedActors; // id, label pairs
+	TArray<FString> NotFoundItems;
 
-	for (const TSharedPtr<FJsonValue>& LabelVal : *LabelsArray)
+	// Process ids first (preferred)
+	if (IdsArray && IdsArray->Num() > 0)
 	{
-		FString Label = LabelVal->AsString();
-		if (Label.IsEmpty())
+		for (const TSharedPtr<FJsonValue>& IdVal : *IdsArray)
 		{
-			continue;
-		}
+			FString Id = IdVal->AsString();
+			if (Id.IsEmpty())
+			{
+				continue;
+			}
 
-		AActor* Actor = FindActorByLabelOrName(Label, TEXT(""));
-		if (Actor)
-		{
-			GEditor->SelectActor(Actor, true, true);
-			SelectedLabels.Add(Label);
+			AActor* Actor = FindActorByIdOrLabel(Id, TEXT(""));
+			if (Actor)
+			{
+				GEditor->SelectActor(Actor, true, true);
+				SelectedActors.Add(TPair<FString, FString>(Actor->GetName(), Actor->GetActorLabel()));
+			}
+			else
+			{
+				NotFoundItems.Add(Id);
+			}
 		}
-		else
+	}
+
+	// Then process labels (backwards compatible)
+	if (LabelsArray && LabelsArray->Num() > 0)
+	{
+		for (const TSharedPtr<FJsonValue>& LabelVal : *LabelsArray)
 		{
-			NotFoundLabels.Add(Label);
+			FString Label = LabelVal->AsString();
+			if (Label.IsEmpty())
+			{
+				continue;
+			}
+
+			AActor* Actor = FindActorByIdOrLabel(TEXT(""), Label);
+			if (Actor)
+			{
+				GEditor->SelectActor(Actor, true, true);
+				SelectedActors.Add(TPair<FString, FString>(Actor->GetName(), Actor->GetActorLabel()));
+			}
+			else
+			{
+				NotFoundItems.Add(Label);
+			}
 		}
 	}
 
 	TSharedPtr<FJsonObject> ResultObj = MakeShareable(new FJsonObject);
 	ResultObj->SetStringField(TEXT("status"), TEXT("ok"));
-	ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Selected %d actors"), SelectedLabels.Num()));
+	ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Selected %d actors"), SelectedActors.Num()));
 
+	// Return selected actors with both id and label
 	TArray<TSharedPtr<FJsonValue>> SelectedArray;
-	for (const FString& Label : SelectedLabels)
+	for (const auto& Pair : SelectedActors)
 	{
-		SelectedArray.Add(MakeShareable(new FJsonValueString(Label)));
+		TSharedPtr<FJsonObject> ActorRef = MakeShareable(new FJsonObject);
+		ActorRef->SetStringField(TEXT("id"), Pair.Key);
+		ActorRef->SetStringField(TEXT("label"), Pair.Value);
+		SelectedArray.Add(MakeShareable(new FJsonValueObject(ActorRef)));
 	}
 	ResultObj->SetArrayField(TEXT("selected"), SelectedArray);
 
-	if (NotFoundLabels.Num() > 0)
+	if (NotFoundItems.Num() > 0)
 	{
 		TArray<TSharedPtr<FJsonValue>> NotFoundArray;
-		for (const FString& Label : NotFoundLabels)
+		for (const FString& Item : NotFoundItems)
 		{
-			NotFoundArray.Add(MakeShareable(new FJsonValueString(Label)));
+			NotFoundArray.Add(MakeShareable(new FJsonValueString(Item)));
 		}
 		ResultObj->SetArrayField(TEXT("not_found"), NotFoundArray);
 	}
@@ -662,16 +728,19 @@ FString UUnrealGPTToolExecutor::ExecuteDuplicateActor(const FString& ArgumentsJs
 		return TEXT("{\"status\":\"error\",\"message\":\"Failed to parse duplicate_actor arguments\"}");
 	}
 
-	FString Label;
-	if (!ArgsObj->TryGetStringField(TEXT("label"), Label) || Label.IsEmpty())
+	FString Id, Label;
+	ArgsObj->TryGetStringField(TEXT("id"), Id);
+	ArgsObj->TryGetStringField(TEXT("label"), Label);
+
+	if (Id.IsEmpty() && Label.IsEmpty())
 	{
-		return TEXT("{\"status\":\"error\",\"message\":\"Missing required field: label\"}");
+		return TEXT("{\"status\":\"error\",\"message\":\"Must provide 'id' or 'label'\"}");
 	}
 
-	AActor* SourceActor = FindActorByLabelOrName(Label, TEXT(""));
+	AActor* SourceActor = FindActorByIdOrLabel(Id, Label);
 	if (!SourceActor)
 	{
-		return FString::Printf(TEXT("{\"status\":\"error\",\"message\":\"Actor not found: %s\"}"), *Label);
+		return FString::Printf(TEXT("{\"status\":\"error\",\"message\":\"Actor not found: %s\"}"), !Id.IsEmpty() ? *Id : *Label);
 	}
 
 	int32 Count = 1;
@@ -697,7 +766,8 @@ FString UUnrealGPTToolExecutor::ExecuteDuplicateActor(const FString& ArgumentsJs
 
 	GEditor->BeginTransaction(NSLOCTEXT("UnrealGPT", "DuplicateActor", "Duplicate Actor"));
 
-	TArray<FString> CreatedLabels;
+	// Track created actors with both id and label
+	TArray<TPair<FString, FString>> CreatedActors; // id, label pairs
 	FVector CurrentOffset = Offset;
 
 	for (int32 i = 0; i < Count; ++i)
@@ -709,7 +779,7 @@ FString UUnrealGPTToolExecutor::ExecuteDuplicateActor(const FString& ArgumentsJs
 		if (NewActor)
 		{
 			NewActor->SetActorScale3D(SourceActor->GetActorScale3D());
-			CreatedLabels.Add(NewActor->GetActorLabel());
+			CreatedActors.Add(TPair<FString, FString>(NewActor->GetName(), NewActor->GetActorLabel()));
 		}
 
 		CurrentOffset += Offset;
@@ -719,12 +789,22 @@ FString UUnrealGPTToolExecutor::ExecuteDuplicateActor(const FString& ArgumentsJs
 
 	TSharedPtr<FJsonObject> ResultObj = MakeShareable(new FJsonObject);
 	ResultObj->SetStringField(TEXT("status"), TEXT("ok"));
-	ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Created %d copies of %s"), CreatedLabels.Num(), *Label));
+	ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Created %d copies of %s"), CreatedActors.Num(), *SourceActor->GetActorLabel()));
 
+	// Include source actor info
+	TSharedPtr<FJsonObject> SourceObj = MakeShareable(new FJsonObject);
+	SourceObj->SetStringField(TEXT("id"), SourceActor->GetName());
+	SourceObj->SetStringField(TEXT("label"), SourceActor->GetActorLabel());
+	ResultObj->SetObjectField(TEXT("source"), SourceObj);
+
+	// Return created actors with both id and label
 	TArray<TSharedPtr<FJsonValue>> CreatedArray;
-	for (const FString& CreatedLabel : CreatedLabels)
+	for (const auto& Pair : CreatedActors)
 	{
-		CreatedArray.Add(MakeShareable(new FJsonValueString(CreatedLabel)));
+		TSharedPtr<FJsonObject> ActorRef = MakeShareable(new FJsonObject);
+		ActorRef->SetStringField(TEXT("id"), Pair.Key);
+		ActorRef->SetStringField(TEXT("label"), Pair.Value);
+		CreatedArray.Add(MakeShareable(new FJsonValueObject(ActorRef)));
 	}
 	ResultObj->SetArrayField(TEXT("created_actors"), CreatedArray);
 
@@ -743,16 +823,19 @@ FString UUnrealGPTToolExecutor::ExecuteSnapActorToGround(const FString& Argument
 		return MakeErrorResult(TEXT("Failed to parse snap_actor_to_ground arguments"));
 	}
 
-	FString Label;
-	if (!ArgsObj->TryGetStringField(TEXT("label"), Label) || Label.IsEmpty())
+	FString Id, Label;
+	ArgsObj->TryGetStringField(TEXT("id"), Id);
+	ArgsObj->TryGetStringField(TEXT("label"), Label);
+
+	if (Id.IsEmpty() && Label.IsEmpty())
 	{
-		return MakeErrorResult(TEXT("Missing required field: label"));
+		return MakeErrorResult(TEXT("Must provide 'id' or 'label'"));
 	}
 
-	AActor* Actor = FindActorByLabelOrName(Label, TEXT(""));
+	AActor* Actor = FindActorByIdOrLabel(Id, Label);
 	if (!Actor)
 	{
-		return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), *Label));
+		return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), !Id.IsEmpty() ? *Id : *Label));
 	}
 
 	UWorld* World = GEditor->GetEditorWorldContext().World();
@@ -808,10 +891,12 @@ FString UUnrealGPTToolExecutor::ExecuteSnapActorToGround(const FString& Argument
 
 	// Build result using helpers
 	TSharedPtr<FJsonObject> Details = MakeShareable(new FJsonObject);
+	Details->SetStringField(TEXT("id"), Actor->GetName());
+	Details->SetStringField(TEXT("label"), Actor->GetActorLabel());
 	Details->SetObjectField(TEXT("new_location"), MakeVectorJson(NewLocation));
 	Details->SetObjectField(TEXT("ground_hit"), MakeVectorJson(HitResult.ImpactPoint));
 
-	return MakeSuccessResult(FString::Printf(TEXT("Snapped %s to ground"), *Label), Details);
+	return MakeSuccessResult(FString::Printf(TEXT("Snapped %s to ground"), *Actor->GetActorLabel()), Details);
 }
 
 FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& ArgumentsJson)
@@ -823,10 +908,15 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& Argument
 		return MakeErrorResult(TEXT("Failed to parse set_actors_rotation arguments"));
 	}
 
+	// Support both 'ids' (preferred) and 'labels' (backwards compatible)
+	const TArray<TSharedPtr<FJsonValue>>* IdsArray = nullptr;
 	const TArray<TSharedPtr<FJsonValue>>* LabelsArray = nullptr;
-	if (!ArgsObj->TryGetArrayField(TEXT("labels"), LabelsArray) || !LabelsArray || LabelsArray->Num() == 0)
+	ArgsObj->TryGetArrayField(TEXT("ids"), IdsArray);
+	ArgsObj->TryGetArrayField(TEXT("labels"), LabelsArray);
+
+	if ((!IdsArray || IdsArray->Num() == 0) && (!LabelsArray || LabelsArray->Num() == 0))
 	{
-		return MakeErrorResult(TEXT("Missing or empty required field: labels (array)"));
+		return MakeErrorResult(TEXT("Must provide 'ids' or 'labels' array"));
 	}
 
 	const TSharedPtr<FJsonObject>* RotObj = nullptr;
@@ -847,35 +937,71 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& Argument
 	// Begin transaction for undo support
 	GEditor->BeginTransaction(NSLOCTEXT("UnrealGPT", "SetActorsRotation", "Set Actors Rotation"));
 
-	TArray<FString> ModifiedLabels;
-	TArray<FString> NotFoundLabels;
+	// Track modified actors with both id and label
+	TArray<TPair<FString, FString>> ModifiedActors; // id, label pairs
+	TArray<FString> NotFoundItems;
 
-	for (const TSharedPtr<FJsonValue>& LabelVal : *LabelsArray)
+	// Process ids first (preferred)
+	if (IdsArray && IdsArray->Num() > 0)
 	{
-		FString Label = LabelVal->AsString();
-		if (Label.IsEmpty())
+		for (const TSharedPtr<FJsonValue>& IdVal : *IdsArray)
 		{
-			continue;
-		}
-
-		AActor* Actor = FindActorByLabelOrName(Label, TEXT(""));
-		if (Actor)
-		{
-			Actor->Modify();
-
-			FRotator FinalRotation = NewRotation;
-			if (bRelative)
+			FString Id = IdVal->AsString();
+			if (Id.IsEmpty())
 			{
-				// Add to current rotation
-				FinalRotation = Actor->GetActorRotation() + NewRotation;
+				continue;
 			}
 
-			Actor->SetActorRotation(FinalRotation);
-			ModifiedLabels.Add(Label);
+			AActor* Actor = FindActorByIdOrLabel(Id, TEXT(""));
+			if (Actor)
+			{
+				Actor->Modify();
+
+				FRotator FinalRotation = NewRotation;
+				if (bRelative)
+				{
+					FinalRotation = Actor->GetActorRotation() + NewRotation;
+				}
+
+				Actor->SetActorRotation(FinalRotation);
+				ModifiedActors.Add(TPair<FString, FString>(Actor->GetName(), Actor->GetActorLabel()));
+			}
+			else
+			{
+				NotFoundItems.Add(Id);
+			}
 		}
-		else
+	}
+
+	// Then process labels (backwards compatible)
+	if (LabelsArray && LabelsArray->Num() > 0)
+	{
+		for (const TSharedPtr<FJsonValue>& LabelVal : *LabelsArray)
 		{
-			NotFoundLabels.Add(Label);
+			FString Label = LabelVal->AsString();
+			if (Label.IsEmpty())
+			{
+				continue;
+			}
+
+			AActor* Actor = FindActorByIdOrLabel(TEXT(""), Label);
+			if (Actor)
+			{
+				Actor->Modify();
+
+				FRotator FinalRotation = NewRotation;
+				if (bRelative)
+				{
+					FinalRotation = Actor->GetActorRotation() + NewRotation;
+				}
+
+				Actor->SetActorRotation(FinalRotation);
+				ModifiedActors.Add(TPair<FString, FString>(Actor->GetName(), Actor->GetActorLabel()));
+			}
+			else
+			{
+				NotFoundItems.Add(Label);
+			}
 		}
 	}
 
@@ -884,10 +1010,10 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& Argument
 	// Build result
 	TSharedPtr<FJsonObject> ResultObj = MakeShareable(new FJsonObject);
 
-	if (ModifiedLabels.Num() > 0)
+	if (ModifiedActors.Num() > 0)
 	{
 		ResultObj->SetStringField(TEXT("status"), TEXT("ok"));
-		ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Rotation updated on %d actor(s)"), ModifiedLabels.Num()));
+		ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Rotation updated on %d actor(s)"), ModifiedActors.Num()));
 	}
 	else
 	{
@@ -895,25 +1021,28 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& Argument
 		ResultObj->SetStringField(TEXT("message"), TEXT("No actors were found/modified"));
 	}
 
-	ResultObj->SetNumberField(TEXT("modified_count"), ModifiedLabels.Num());
+	ResultObj->SetNumberField(TEXT("modified_count"), ModifiedActors.Num());
 
-	// Include sample of modified labels (limit to first 10)
-	TArray<TSharedPtr<FJsonValue>> SampleLabels;
-	int32 SampleLimit = FMath::Min(ModifiedLabels.Num(), 10);
+	// Include sample of modified actors with both id and label (limit to first 10)
+	TArray<TSharedPtr<FJsonValue>> ModifiedSample;
+	int32 SampleLimit = FMath::Min(ModifiedActors.Num(), 10);
 	for (int32 i = 0; i < SampleLimit; ++i)
 	{
-		SampleLabels.Add(MakeShareable(new FJsonValueString(ModifiedLabels[i])));
+		TSharedPtr<FJsonObject> ActorRef = MakeShareable(new FJsonObject);
+		ActorRef->SetStringField(TEXT("id"), ModifiedActors[i].Key);
+		ActorRef->SetStringField(TEXT("label"), ModifiedActors[i].Value);
+		ModifiedSample.Add(MakeShareable(new FJsonValueObject(ActorRef)));
 	}
-	ResultObj->SetArrayField(TEXT("modified_labels_sample"), SampleLabels);
+	ResultObj->SetArrayField(TEXT("modified_sample"), ModifiedSample);
 
-	if (NotFoundLabels.Num() > 0)
+	if (NotFoundItems.Num() > 0)
 	{
-		ResultObj->SetNumberField(TEXT("not_found_count"), NotFoundLabels.Num());
+		ResultObj->SetNumberField(TEXT("not_found_count"), NotFoundItems.Num());
 		TArray<TSharedPtr<FJsonValue>> NotFoundArr;
-		int32 NotFoundLimit = FMath::Min(NotFoundLabels.Num(), 5);
+		int32 NotFoundLimit = FMath::Min(NotFoundItems.Num(), 5);
 		for (int32 i = 0; i < NotFoundLimit; ++i)
 		{
-			NotFoundArr.Add(MakeShareable(new FJsonValueString(NotFoundLabels[i])));
+			NotFoundArr.Add(MakeShareable(new FJsonValueString(NotFoundItems[i])));
 		}
 		ResultObj->SetArrayField(TEXT("not_found_sample"), NotFoundArr);
 	}

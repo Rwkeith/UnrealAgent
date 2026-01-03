@@ -52,6 +52,13 @@ public:
 	/** Focus viewport on the last created asset/actor */
 	static void FocusViewportOnCreatedAsset(const FString& ResultJson);
 
-	/** Find actor by label or name */
+	/**
+	 * Find actor by Id (internal name) or Label (display name).
+	 * Id takes priority - it's the stable unique identifier (Actor->GetName()).
+	 * Label is the user-friendly display name shown in Outliner (Actor->GetActorLabel()).
+	 */
+	static AActor* FindActorByIdOrLabel(const FString& Id, const FString& Label);
+
+	/** Legacy wrapper - Find actor by label or name (backwards compatibility) */
 	static AActor* FindActorByLabelOrName(const FString& Label, const FString& Name);
 };

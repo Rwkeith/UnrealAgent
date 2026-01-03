@@ -579,7 +579,11 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 	if (bUseResponsesApi)
 	{
 		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Using Responses API for agentic tool calling"));
-		
+
+		// Enable automatic truncation to handle context length limits gracefully
+		// This truncates from the middle, preserving system prompt and recent messages
+		RequestJson->SetStringField(TEXT("truncation"), TEXT("auto"));
+
 		// For Responses API, use previous_response_id if available
 		if (!PreviousResponseId.IsEmpty())
 		{
@@ -2616,10 +2620,11 @@ FString UUnrealGPTAgentClient::DetermineReasoningEffort(const FString& UserMessa
 		return TEXT("medium");
 	}
 
-	// LOW effort: simple, direct operations
-	// Single object manipulation, clear instructions, straightforward tool calls
-	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Reasoning effort = LOW (straightforward operation)"));
-	return TEXT("low");
+	// MEDIUM as baseline: this agent always involves tool execution (Python code, atomic tools)
+	// which benefits from additional reasoning to avoid mistakes in code generation.
+	// LOW would only be appropriate for pure Q&A without tool use, which this agent doesn't do.
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Reasoning effort = MEDIUM (baseline for tool-using agent)"));
+	return TEXT("medium");
 }
 
 bool UUnrealGPTAgentClient::DetectTaskCompletion(const TArray<FString>& ToolNames, const TArray<FString>& ToolResults) const
