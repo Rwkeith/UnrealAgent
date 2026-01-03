@@ -5,6 +5,7 @@
 #include "Http.h"
 #include "Dom/JsonObject.h"
 #include "UnrealGPTSessionTypes.h"
+#include "UnrealGPTToolCallTypes.h"
 #include "UnrealGPTAgentClient.generated.h"
 
 // Forward declarations
@@ -51,20 +52,12 @@ struct FToolDefinition
 	FString ParametersSchema; // JSON schema as string
 };
 
-/**
- * Information about a tool call extracted from API response.
- */
-struct FToolCallInfo
-{
-	FString Id;
-	FString Name;
-	FString Arguments;
-};
-
 UCLASS()
 class UNREALGPTEDITOR_API UUnrealGPTAgentClient : public UObject
 {
 	GENERATED_BODY()
+
+	friend class UnrealGPTHttpClient;
 
 public:
 	UUnrealGPTAgentClient();
@@ -129,10 +122,6 @@ private:
 
 	/** Process standard JSON response from Responses API (non-streaming) */
 	void ProcessResponsesApiResponse(const FString& ResponseContent);
-
-	// ==================== RESPONSE PROCESSING HELPERS ====================
-	/** Extract tool calls and text from Responses API output array */
-	void ExtractFromResponseOutput(const TArray<TSharedPtr<FJsonValue>>& OutputArray, TArray<FToolCallInfo>& OutToolCalls, FString& OutAccumulatedText);
 
 	/** Process extracted tool calls: execute them and continue conversation */
 	void ProcessExtractedToolCalls(const TArray<FToolCallInfo>& ToolCalls, const FString& AccumulatedText);
@@ -251,6 +240,5 @@ private:
 	void SaveToolCallToSession(const FString& ToolName, const FString& Arguments, const FString& Result);
 
 	/** Extract base64 images from tool result string */
-	TArray<FString> ExtractImagesFromToolResult(const FString& ToolResult) const;
 };
 

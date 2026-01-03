@@ -1,5 +1,6 @@
 #include "UnrealGPTToolExecutor.h"
 #include "UnrealGPTSceneContext.h"
+#include "UnrealGPTJsonHelpers.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -17,57 +18,6 @@
 
 namespace
 {
-	// ==================== JSON HELPER FUNCTIONS ====================
-
-	/** Build a JSON object from an FVector */
-	TSharedPtr<FJsonObject> MakeVectorJson(const FVector& V)
-	{
-		TSharedPtr<FJsonObject> Obj = MakeShareable(new FJsonObject);
-		Obj->SetNumberField(TEXT("x"), V.X);
-		Obj->SetNumberField(TEXT("y"), V.Y);
-		Obj->SetNumberField(TEXT("z"), V.Z);
-		return Obj;
-	}
-
-	/** Build a JSON object from an FRotator */
-	TSharedPtr<FJsonObject> MakeRotatorJson(const FRotator& R)
-	{
-		TSharedPtr<FJsonObject> Obj = MakeShareable(new FJsonObject);
-		Obj->SetNumberField(TEXT("pitch"), R.Pitch);
-		Obj->SetNumberField(TEXT("yaw"), R.Yaw);
-		Obj->SetNumberField(TEXT("roll"), R.Roll);
-		return Obj;
-	}
-
-	/** Build a standard tool result JSON string with status, message, and optional details */
-	FString MakeToolResult(const FString& Status, const FString& Message, TSharedPtr<FJsonObject> Details = nullptr)
-	{
-		TSharedPtr<FJsonObject> ResultObj = MakeShareable(new FJsonObject);
-		ResultObj->SetStringField(TEXT("status"), Status);
-		ResultObj->SetStringField(TEXT("message"), Message);
-		if (Details.IsValid())
-		{
-			ResultObj->SetObjectField(TEXT("details"), Details);
-		}
-
-		FString ResultString;
-		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultString);
-		FJsonSerializer::Serialize(ResultObj.ToSharedRef(), Writer);
-		return ResultString;
-	}
-
-	/** Shorthand for error results */
-	FString MakeErrorResult(const FString& Message)
-	{
-		return MakeToolResult(TEXT("error"), Message);
-	}
-
-	/** Shorthand for success results */
-	FString MakeSuccessResult(const FString& Message, TSharedPtr<FJsonObject> Details = nullptr)
-	{
-		return MakeToolResult(TEXT("ok"), Message, Details);
-	}
-
 	/** Helper to indent arbitrary Python source one level (4 spaces), preserving empty lines. */
 	FString IndentPythonCode(const FString& Code)
 	{
@@ -451,22 +401,22 @@ FString UUnrealGPTToolExecutor::ExecuteGetActor(const FString& ArgumentsJson)
 
 	// Location
 	FVector Location = Actor->GetActorLocation();
-	ActorObj->SetObjectField(TEXT("location"), MakeVectorJson(Location));
+	ActorObj->SetObjectField(TEXT("location"), UnrealGPTJsonHelpers::MakeVectorJson(Location));
 
 	// Rotation
 	FRotator Rotation = Actor->GetActorRotation();
-	ActorObj->SetObjectField(TEXT("rotation"), MakeRotatorJson(Rotation));
+	ActorObj->SetObjectField(TEXT("rotation"), UnrealGPTJsonHelpers::MakeRotatorJson(Rotation));
 
 	// Scale
 	FVector Scale = Actor->GetActorScale3D();
-	ActorObj->SetObjectField(TEXT("scale"), MakeVectorJson(Scale));
+	ActorObj->SetObjectField(TEXT("scale"), UnrealGPTJsonHelpers::MakeVectorJson(Scale));
 
 	// Bounds
 	FVector Origin, Extent;
 	Actor->GetActorBounds(false, Origin, Extent);
 	TSharedPtr<FJsonObject> BoundsObj = MakeShareable(new FJsonObject);
-	BoundsObj->SetObjectField(TEXT("origin"), MakeVectorJson(Origin));
-	BoundsObj->SetObjectField(TEXT("extent"), MakeVectorJson(Extent));
+	BoundsObj->SetObjectField(TEXT("origin"), UnrealGPTJsonHelpers::MakeVectorJson(Origin));
+	BoundsObj->SetObjectField(TEXT("extent"), UnrealGPTJsonHelpers::MakeVectorJson(Extent));
 	ActorObj->SetObjectField(TEXT("bounds"), BoundsObj);
 
 	// Mobility
@@ -524,7 +474,7 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorTransform(const FString& Argument
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgumentsJson);
 	if (!(FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid()))
 	{
-		return MakeErrorResult(TEXT("Failed to parse set_actor_transform arguments"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("Failed to parse set_actor_transform arguments"));
 	}
 
 	FString Id, Label;
@@ -533,13 +483,13 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorTransform(const FString& Argument
 
 	if (Id.IsEmpty() && Label.IsEmpty())
 	{
-		return MakeErrorResult(TEXT("Must provide 'id' or 'label'"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("Must provide 'id' or 'label'"));
 	}
 
 	AActor* Actor = FindActorByIdOrLabel(Id, Label);
 	if (!Actor)
 	{
-		return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), !Id.IsEmpty() ? *Id : *Label));
+		return UnrealGPTJsonHelpers::MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), !Id.IsEmpty() ? *Id : *Label));
 	}
 
 	// Begin transaction for undo support
@@ -596,16 +546,16 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorTransform(const FString& Argument
 
 	// Build result using helpers
 	TSharedPtr<FJsonObject> NewTransform = MakeShareable(new FJsonObject);
-	NewTransform->SetObjectField(TEXT("location"), MakeVectorJson(Location));
-	NewTransform->SetObjectField(TEXT("rotation"), MakeRotatorJson(Rotation));
-	NewTransform->SetObjectField(TEXT("scale"), MakeVectorJson(Scale));
+	NewTransform->SetObjectField(TEXT("location"), UnrealGPTJsonHelpers::MakeVectorJson(Location));
+	NewTransform->SetObjectField(TEXT("rotation"), UnrealGPTJsonHelpers::MakeRotatorJson(Rotation));
+	NewTransform->SetObjectField(TEXT("scale"), UnrealGPTJsonHelpers::MakeVectorJson(Scale));
 
 	TSharedPtr<FJsonObject> Details = MakeShareable(new FJsonObject);
 	Details->SetStringField(TEXT("id"), Actor->GetName());
 	Details->SetStringField(TEXT("label"), Actor->GetActorLabel());
 	Details->SetObjectField(TEXT("transform"), NewTransform);
 
-	return MakeSuccessResult(FString::Printf(TEXT("Transform updated for %s"), *Actor->GetActorLabel()), Details);
+	return UnrealGPTJsonHelpers::MakeSuccessResult(FString::Printf(TEXT("Transform updated for %s"), *Actor->GetActorLabel()), Details);
 }
 
 FString UUnrealGPTToolExecutor::ExecuteSelectActors(const FString& ArgumentsJson)
@@ -820,7 +770,7 @@ FString UUnrealGPTToolExecutor::ExecuteSnapActorToGround(const FString& Argument
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgumentsJson);
 	if (!(FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid()))
 	{
-		return MakeErrorResult(TEXT("Failed to parse snap_actor_to_ground arguments"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("Failed to parse snap_actor_to_ground arguments"));
 	}
 
 	FString Id, Label;
@@ -829,19 +779,19 @@ FString UUnrealGPTToolExecutor::ExecuteSnapActorToGround(const FString& Argument
 
 	if (Id.IsEmpty() && Label.IsEmpty())
 	{
-		return MakeErrorResult(TEXT("Must provide 'id' or 'label'"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("Must provide 'id' or 'label'"));
 	}
 
 	AActor* Actor = FindActorByIdOrLabel(Id, Label);
 	if (!Actor)
 	{
-		return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), !Id.IsEmpty() ? *Id : *Label));
+		return UnrealGPTJsonHelpers::MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), !Id.IsEmpty() ? *Id : *Label));
 	}
 
 	UWorld* World = GEditor->GetEditorWorldContext().World();
 	if (!World)
 	{
-		return MakeErrorResult(TEXT("No world available"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("No world available"));
 	}
 
 	bool bAlignToNormal = false;
@@ -867,7 +817,7 @@ FString UUnrealGPTToolExecutor::ExecuteSnapActorToGround(const FString& Argument
 
 	if (!bHit)
 	{
-		return MakeErrorResult(TEXT("No ground found below actor"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("No ground found below actor"));
 	}
 
 	GEditor->BeginTransaction(NSLOCTEXT("UnrealGPT", "SnapActorToGround", "Snap Actor To Ground"));
@@ -893,10 +843,10 @@ FString UUnrealGPTToolExecutor::ExecuteSnapActorToGround(const FString& Argument
 	TSharedPtr<FJsonObject> Details = MakeShareable(new FJsonObject);
 	Details->SetStringField(TEXT("id"), Actor->GetName());
 	Details->SetStringField(TEXT("label"), Actor->GetActorLabel());
-	Details->SetObjectField(TEXT("new_location"), MakeVectorJson(NewLocation));
-	Details->SetObjectField(TEXT("ground_hit"), MakeVectorJson(HitResult.ImpactPoint));
+	Details->SetObjectField(TEXT("new_location"), UnrealGPTJsonHelpers::MakeVectorJson(NewLocation));
+	Details->SetObjectField(TEXT("ground_hit"), UnrealGPTJsonHelpers::MakeVectorJson(HitResult.ImpactPoint));
 
-	return MakeSuccessResult(FString::Printf(TEXT("Snapped %s to ground"), *Actor->GetActorLabel()), Details);
+	return UnrealGPTJsonHelpers::MakeSuccessResult(FString::Printf(TEXT("Snapped %s to ground"), *Actor->GetActorLabel()), Details);
 }
 
 FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& ArgumentsJson)
@@ -905,7 +855,7 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& Argument
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgumentsJson);
 	if (!(FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid()))
 	{
-		return MakeErrorResult(TEXT("Failed to parse set_actors_rotation arguments"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("Failed to parse set_actors_rotation arguments"));
 	}
 
 	// Support both 'ids' (preferred) and 'labels' (backwards compatible)
@@ -916,13 +866,13 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& Argument
 
 	if ((!IdsArray || IdsArray->Num() == 0) && (!LabelsArray || LabelsArray->Num() == 0))
 	{
-		return MakeErrorResult(TEXT("Must provide 'ids' or 'labels' array"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("Must provide 'ids' or 'labels' array"));
 	}
 
 	const TSharedPtr<FJsonObject>* RotObj = nullptr;
 	if (!ArgsObj->TryGetObjectField(TEXT("rotation"), RotObj) || !RotObj)
 	{
-		return MakeErrorResult(TEXT("Missing required field: rotation"));
+		return UnrealGPTJsonHelpers::MakeErrorResult(TEXT("Missing required field: rotation"));
 	}
 
 	double Pitch = 0.0, Yaw = 0.0, Roll = 0.0;
@@ -1047,7 +997,7 @@ FString UUnrealGPTToolExecutor::ExecuteSetActorsRotation(const FString& Argument
 		ResultObj->SetArrayField(TEXT("not_found_sample"), NotFoundArr);
 	}
 
-	ResultObj->SetObjectField(TEXT("applied_rotation"), MakeRotatorJson(NewRotation));
+	ResultObj->SetObjectField(TEXT("applied_rotation"), UnrealGPTJsonHelpers::MakeRotatorJson(NewRotation));
 	ResultObj->SetBoolField(TEXT("relative"), bRelative);
 
 	FString ResultString;

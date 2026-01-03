@@ -4,6 +4,18 @@
 #include "UnrealGPTReplicateClient.h"
 #include "UnrealGPTToolSchemas.h"
 #include "UnrealGPTToolExecutor.h"
+#include "UnrealGPTJsonHelpers.h"
+#include "UnrealGPTRequestBuilder.h"
+#include "UnrealGPTRequestConfigBuilder.h"
+#include "UnrealGPTResponseParser.h"
+#include "UnrealGPTConversationState.h"
+#include "UnrealGPTToolDispatcher.h"
+#include "UnrealGPTToolResultProcessor.h"
+#include "UnrealGPTTelemetry.h"
+#include "UnrealGPTSessionWriter.h"
+#include "UnrealGPTNotifier.h"
+#include "UnrealGPTHttpClient.h"
+#include "UnrealGPTRetryPolicy.h"
 #include "UnrealGPTSessionManager.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
@@ -34,313 +46,6 @@ namespace
 		return FString::Printf(TEXT("%u.%u"), FEngineVersion::Current().GetMajor(), FEngineVersion::Current().GetMinor());
 	}
 
-	/** Helper: Get the path to the conversation log file for a given session */
-	FString GetConversationLogPath(const FString& SessionId)
-	{
-		// Save to project's Saved/Logs folder with session ID in filename
-		const FString Filename = FString::Printf(TEXT("UnrealGPT_Conversation_%s.jsonl"), *SessionId);
-		return FPaths::ProjectSavedDir() / TEXT("Logs") / Filename;
-	}
-
-	/** Helper: Log API request/response to conversation history file
-	 *  Format: JSON Lines (one JSON object per line) for easy parsing
-	 *  Each entry contains: timestamp, direction (request/response), and the full JSON body
-	 */
-	void LogApiConversation(const FString& SessionId, const FString& Direction, const FString& JsonBody, int32 ResponseCode = 0)
-	{
-		if (SessionId.IsEmpty())
-		{
-			return; // No session, skip logging
-		}
-		const FString ConversationLogPath = GetConversationLogPath(SessionId);
-
-		// Create a JSON object for this log entry
-		TSharedPtr<FJsonObject> LogEntry = MakeShareable(new FJsonObject);
-		LogEntry->SetStringField(TEXT("timestamp"), FDateTime::Now().ToIso8601());
-		LogEntry->SetStringField(TEXT("direction"), Direction);
-
-		if (ResponseCode > 0)
-		{
-			LogEntry->SetNumberField(TEXT("status_code"), ResponseCode);
-		}
-
-		// Parse the JSON body to include it as a nested object (not escaped string)
-		TSharedPtr<FJsonObject> BodyJson;
-		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonBody);
-		if (FJsonSerializer::Deserialize(Reader, BodyJson) && BodyJson.IsValid())
-		{
-			LogEntry->SetObjectField(TEXT("body"), BodyJson);
-		}
-		else
-		{
-			// If parsing fails, store as raw string (might be truncated or malformed)
-			LogEntry->SetStringField(TEXT("body_raw"), JsonBody.Left(50000)); // Limit raw string size
-		}
-
-		// Serialize to a single line of JSON
-		FString LogLine;
-		TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&LogLine);
-		FJsonSerializer::Serialize(LogEntry.ToSharedRef(), Writer);
-		LogLine += TEXT("\n");
-
-		// Append to file (create if doesn't exist)
-		FFileHelper::SaveStringToFile(
-			LogLine,
-			*ConversationLogPath,
-			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM,
-			&IFileManager::Get(),
-			EFileWrite::FILEWRITE_Append
-		);
-
-		UE_LOG(LogTemp, Verbose, TEXT("UnrealGPT: Logged %s to conversation history"), *Direction);
-	}
-
-	/** Helper: convert an FProperty into a compact JSON description */
-	TSharedPtr<FJsonObject> BuildPropertyJson(FProperty* Property)
-	{
-		if (!Property)
-		{
-			return nullptr;
-		}
-
-		TSharedPtr<FJsonObject> PropJson = MakeShareable(new FJsonObject);
-		PropJson->SetStringField(TEXT("name"), Property->GetName());
-		PropJson->SetStringField(TEXT("cpp_type"), Property->GetCPPType(nullptr, 0));
-		PropJson->SetStringField(TEXT("ue_type"), Property->GetClass() ? Property->GetClass()->GetName() : TEXT("Unknown"));
-
-		// Basic, high-signal property flags that are relevant for Python/Blueprint use.
-		TArray<FString> Flags;
-		if (Property->HasAnyPropertyFlags(CPF_Edit))
-		{
-			Flags.Add(TEXT("Edit"));
-		}
-		if (Property->HasAnyPropertyFlags(CPF_BlueprintVisible))
-		{
-			Flags.Add(TEXT("BlueprintVisible"));
-		}
-		if (Property->HasAnyPropertyFlags(CPF_BlueprintReadOnly))
-		{
-			Flags.Add(TEXT("BlueprintReadOnly"));
-		}
-		if (Property->HasAnyPropertyFlags(CPF_Transient))
-		{
-			Flags.Add(TEXT("Transient"));
-		}
-		if (Property->HasAnyPropertyFlags(CPF_Config))
-		{
-			Flags.Add(TEXT("Config"));
-		}
-
-		if (Flags.Num() > 0)
-		{
-			TArray<TSharedPtr<FJsonValue>> FlagValues;
-			for (const FString& Flag : Flags)
-			{
-				FlagValues.Add(MakeShareable(new FJsonValueString(Flag)));
-			}
-			PropJson->SetArrayField(TEXT("flags"), FlagValues);
-		}
-
-		return PropJson;
-	}
-
-	/** Helper: convert a UFunction into a compact JSON description */
-	TSharedPtr<FJsonObject> BuildFunctionJson(UFunction* Function)
-	{
-		if (!Function)
-		{
-			return nullptr;
-		}
-
-		TSharedPtr<FJsonObject> FuncJson = MakeShareable(new FJsonObject);
-		FuncJson->SetStringField(TEXT("name"), Function->GetName());
-
-		// Function flags: only expose the ones that matter for scripting.
-		TArray<FString> Flags;
-		if (Function->HasAnyFunctionFlags(FUNC_BlueprintCallable))
-		{
-			Flags.Add(TEXT("BlueprintCallable"));
-		}
-		if (Function->HasAnyFunctionFlags(FUNC_BlueprintPure))
-		{
-			Flags.Add(TEXT("BlueprintPure"));
-		}
-		if (Function->HasAnyFunctionFlags(FUNC_BlueprintEvent))
-		{
-			Flags.Add(TEXT("BlueprintEvent"));
-		}
-		if (Function->HasAnyFunctionFlags(FUNC_Net))
-		{
-			Flags.Add(TEXT("Net"));
-		}
-		if (Function->HasAnyFunctionFlags(FUNC_Static))
-		{
-			Flags.Add(TEXT("Static"));
-		}
-
-		if (Flags.Num() > 0)
-		{
-			TArray<TSharedPtr<FJsonValue>> FlagValues;
-			for (const FString& Flag : Flags)
-			{
-				FlagValues.Add(MakeShareable(new FJsonValueString(Flag)));
-			}
-			FuncJson->SetArrayField(TEXT("flags"), FlagValues);
-		}
-
-		// Parameters and return type.
-		TArray<TSharedPtr<FJsonValue>> ParamsJson;
-		TSharedPtr<FJsonObject> ReturnJson;
-
-		for (TFieldIterator<FProperty> ParamIt(Function); ParamIt; ++ParamIt)
-		{
-			FProperty* ParamProp = *ParamIt;
-			if (!ParamProp)
-			{
-				continue;
-			}
-
-			const bool bIsReturn = ParamProp->HasAnyPropertyFlags(CPF_ReturnParm);
-			if (bIsReturn)
-			{
-				ReturnJson = MakeShareable(new FJsonObject);
-				ReturnJson->SetStringField(TEXT("name"), ParamProp->GetName());
-				ReturnJson->SetStringField(TEXT("cpp_type"), ParamProp->GetCPPType(nullptr, 0));
-				ReturnJson->SetStringField(TEXT("ue_type"), ParamProp->GetClass() ? ParamProp->GetClass()->GetName() : TEXT("Unknown"));
-				continue;
-			}
-
-			if (!ParamProp->HasAnyPropertyFlags(CPF_Parm))
-			{
-				continue;
-			}
-
-			TSharedPtr<FJsonObject> ParamJson = MakeShareable(new FJsonObject);
-			ParamJson->SetStringField(TEXT("name"), ParamProp->GetName());
-			ParamJson->SetStringField(TEXT("cpp_type"), ParamProp->GetCPPType(nullptr, 0));
-			ParamJson->SetStringField(TEXT("ue_type"), ParamProp->GetClass() ? ParamProp->GetClass()->GetName() : TEXT("Unknown"));
-			ParamJson->SetBoolField(TEXT("is_out"), ParamProp->HasAnyPropertyFlags(CPF_OutParm | CPF_ReferenceParm));
-
-			ParamsJson.Add(MakeShareable(new FJsonValueObject(ParamJson)));
-		}
-
-		if (ParamsJson.Num() > 0)
-		{
-			FuncJson->SetArrayField(TEXT("parameters"), ParamsJson);
-		}
-		if (ReturnJson.IsValid())
-		{
-			FuncJson->SetObjectField(TEXT("return"), ReturnJson);
-		}
-
-		return FuncJson;
-	}
-
-	/** Helper: build a reflection "schema" JSON object for a class */
-	FString BuildReflectionSchemaJson(UClass* Class)
-	{
-		if (!Class)
-		{
-			TSharedPtr<FJsonObject> ErrorObj = MakeShareable(new FJsonObject);
-			ErrorObj->SetStringField(TEXT("status"), TEXT("error"));
-			ErrorObj->SetStringField(TEXT("message"), TEXT("Class not found"));
-
-			FString ErrorJson;
-			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ErrorJson);
-			FJsonSerializer::Serialize(ErrorObj.ToSharedRef(), Writer);
-			return ErrorJson;
-		}
-
-		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
-		Root->SetStringField(TEXT("status"), TEXT("ok"));
-		Root->SetStringField(TEXT("class_name"), Class->GetName());
-		Root->SetStringField(TEXT("path_name"), Class->GetPathName());
-		Root->SetStringField(TEXT("cpp_type"), FString::Printf(TEXT("%s*"), *Class->GetName()));
-
-		// Properties
-		TArray<TSharedPtr<FJsonValue>> PropertiesJson;
-		for (TFieldIterator<FProperty> PropIt(Class, EFieldIteratorFlags::IncludeSuper); PropIt; ++PropIt)
-		{
-			FProperty* Property = *PropIt;
-			TSharedPtr<FJsonObject> PropJson = BuildPropertyJson(Property);
-			if (PropJson.IsValid())
-			{
-				PropertiesJson.Add(MakeShareable(new FJsonValueObject(PropJson)));
-			}
-		}
-		Root->SetArrayField(TEXT("properties"), PropertiesJson);
-
-		// Functions
-		TArray<TSharedPtr<FJsonValue>> FunctionsJson;
-		for (TFieldIterator<UFunction> FuncIt(Class, EFieldIteratorFlags::IncludeSuper); FuncIt; ++FuncIt)
-		{
-			UFunction* Function = *FuncIt;
-			TSharedPtr<FJsonObject> FuncJson = BuildFunctionJson(Function);
-			if (FuncJson.IsValid())
-			{
-				FunctionsJson.Add(MakeShareable(new FJsonValueObject(FuncJson)));
-			}
-		}
-		Root->SetArrayField(TEXT("functions"), FunctionsJson);
-
-		FString OutJson;
-		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutJson);
-		FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
-		return OutJson;
-	}
-
-	// ==================== JSON HELPER FUNCTIONS ====================
-	// These reduce repetition when building JSON for tool results and transforms
-
-	/** Build a JSON object from an FVector */
-	TSharedPtr<FJsonObject> MakeVectorJson(const FVector& V)
-	{
-		TSharedPtr<FJsonObject> Obj = MakeShareable(new FJsonObject);
-		Obj->SetNumberField(TEXT("x"), V.X);
-		Obj->SetNumberField(TEXT("y"), V.Y);
-		Obj->SetNumberField(TEXT("z"), V.Z);
-		return Obj;
-	}
-
-	/** Build a JSON object from an FRotator */
-	TSharedPtr<FJsonObject> MakeRotatorJson(const FRotator& R)
-	{
-		TSharedPtr<FJsonObject> Obj = MakeShareable(new FJsonObject);
-		Obj->SetNumberField(TEXT("pitch"), R.Pitch);
-		Obj->SetNumberField(TEXT("yaw"), R.Yaw);
-		Obj->SetNumberField(TEXT("roll"), R.Roll);
-		return Obj;
-	}
-
-	/** Build a standard tool result JSON string with status, message, and optional details */
-	FString MakeToolResult(const FString& Status, const FString& Message, TSharedPtr<FJsonObject> Details = nullptr)
-	{
-		TSharedPtr<FJsonObject> ResultObj = MakeShareable(new FJsonObject);
-		ResultObj->SetStringField(TEXT("status"), Status);
-		ResultObj->SetStringField(TEXT("message"), Message);
-		if (Details.IsValid())
-		{
-			ResultObj->SetObjectField(TEXT("details"), Details);
-		}
-
-		FString ResultString;
-		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultString);
-		FJsonSerializer::Serialize(ResultObj.ToSharedRef(), Writer);
-		return ResultString;
-	}
-
-	/** Shorthand for error results */
-	FString MakeErrorResult(const FString& Message)
-	{
-		return MakeToolResult(TEXT("error"), Message);
-	}
-
-	/** Shorthand for success results */
-	FString MakeSuccessResult(const FString& Message, TSharedPtr<FJsonObject> Details = nullptr)
-	{
-		return MakeToolResult(TEXT("ok"), Message, Details);
-	}
 }
 
 UUnrealGPTAgentClient::UUnrealGPTAgentClient()
@@ -489,13 +194,12 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 					UE_LOG(LogTemp, Error, TEXT("UnrealGPT: Maximum tool call iterations (%d) reached. Stopping to prevent infinite loop."), MaxIterations);
 
 					// Add a system message to history so the model knows it was interrupted
-					FAgentMessage LimitEntry;
-					LimitEntry.Role = TEXT("assistant");
-					LimitEntry.Content = FString::Printf(TEXT("[Tool call limit reached after %d iterations. The conversation will continue from here. You can adjust the limit in Project Settings > UnrealGPT > Safety > Max Tool Call Iterations, or set to 0 for unlimited.]"), MaxIterations);
-					ConversationHistory.Add(LimitEntry);
+					FAgentMessage LimitEntry = UnrealGPTConversationState::CreateAssistantMessage(
+						FString::Printf(TEXT("[Tool call limit reached after %d iterations. The conversation will continue from here. You can adjust the limit in Project Settings > UnrealGPT > Safety > Max Tool Call Iterations, or set to 0 for unlimited.]"), MaxIterations));
+					UnrealGPTConversationState::AppendMessage(ConversationHistory, LimitEntry);
 
 					// Notify UI that we stopped
-					OnAgentMessage.Broadcast(TEXT("assistant"), LimitEntry.Content, TArray<FString>());
+					UnrealGPTNotifier::BroadcastAgentMessage(this, LimitEntry.Content, TArray<FString>());
 
 					ToolCallIterationCount = 0;
 					bRequestInProgress = false;
@@ -513,10 +217,8 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 	// Use ProcessedMessage which may have been truncated for size limits
 	if (!ProcessedMessage.IsEmpty())
 	{
-		FAgentMessage UserMsg;
-		UserMsg.Role = TEXT("user");
-		UserMsg.Content = ProcessedMessage;
-		ConversationHistory.Add(UserMsg);
+		FAgentMessage UserMsg = UnrealGPTConversationState::CreateUserMessage(ProcessedMessage);
+		UnrealGPTConversationState::AppendMessage(ConversationHistory, UserMsg);
 		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added user message to history: %s"), *ProcessedMessage.Left(100));
 
 		// Save to session for persistence
@@ -530,67 +232,25 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 	// Build request JSON
 	// Note: Using Responses API (/v1/responses) for better agentic tool calling support
 	TSharedPtr<FJsonObject> RequestJson = MakeShareable(new FJsonObject);
-	RequestJson->SetStringField(TEXT("model"), Settings->DefaultModel);
 	const bool bUseResponsesApi = IsUsingResponsesApi();
 
 	// Configure reasoning effort dynamically based on task complexity
 	// (Responses API + gpt-5/o-series models)
-	if (bUseResponsesApi)
-	{
-		// Simple check for models that likely support reasoning
-		const FString ModelName = Settings->DefaultModel.ToLower();
-		const bool bSupportsReasoning = ModelName.Contains(TEXT("gpt-5")) || ModelName.Contains(TEXT("o1")) || ModelName.Contains(TEXT("o3"));
-
-		if (bSupportsReasoning)
-		{
-			// Determine appropriate effort level based on message complexity
-			const FString ReasoningEffort = DetermineReasoningEffort(UserMessage, ImageBase64);
-
-			TSharedPtr<FJsonObject> ReasoningObj = MakeShareable(new FJsonObject);
-			ReasoningObj->SetStringField(TEXT("effort"), ReasoningEffort);
-			if (bAllowReasoningSummary)
-			{
-				ReasoningObj->SetStringField(TEXT("summary"), TEXT("auto"));
-			}
-			RequestJson->SetObjectField(TEXT("reasoning"), ReasoningObj);
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Enabled reasoning (effort: %s%s) for model %s"),
-				*ReasoningEffort,
-				bAllowReasoningSummary ? TEXT(", summary: auto") : TEXT(""),
-				*Settings->DefaultModel);
-		}
-	}
+	const FString ReasoningEffort = bUseResponsesApi
+		? DetermineReasoningEffort(UserMessage, ImageBase64)
+		: FString();
 
 	// High-level behavior instructions for the agent (extracted to separate file for readability)
 	const FString EngineVersion = GetEngineVersionString();
 	const FString AgentInstructions = UnrealGPTAgentInstructions::GetInstructions(EngineVersion);
-	if (bUseResponsesApi)
-	{
-		RequestJson->SetStringField(TEXT("instructions"), AgentInstructions);
-
-		TSharedPtr<FJsonObject> TextObj = MakeShareable(new FJsonObject);
-		TextObj->SetStringField(TEXT("verbosity"), TEXT("low"));
-		RequestJson->SetObjectField(TEXT("text"), TextObj);
-
-		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Set Responses API verbosity to low for concise outputs"));
-	}
-	// Temporarily disable streaming for Responses API until SSE parser fully supports new event schema
-	RequestJson->SetBoolField(TEXT("stream"), !bUseResponsesApi);
-	
-	if (bUseResponsesApi)
-	{
-		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Using Responses API for agentic tool calling"));
-
-		// Enable automatic truncation to handle context length limits gracefully
-		// This truncates from the middle, preserving system prompt and recent messages
-		RequestJson->SetStringField(TEXT("truncation"), TEXT("auto"));
-
-		// For Responses API, use previous_response_id if available
-		if (!PreviousResponseId.IsEmpty())
-		{
-			RequestJson->SetStringField(TEXT("previous_response_id"), PreviousResponseId);
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Using previous_response_id: %s"), *PreviousResponseId);
-		}
-	}
+	UnrealGPTRequestConfigBuilder::ConfigureRequest(
+		RequestJson,
+		Settings,
+		bUseResponsesApi,
+		bAllowReasoningSummary,
+		AgentInstructions,
+		ReasoningEffort,
+		PreviousResponseId);
 
 	// Build messages array
 	TArray<TSharedPtr<FJsonValue>> MessagesArray;
@@ -607,96 +267,9 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 	
 	if (bUseResponsesApi && !PreviousResponseId.IsEmpty())
 	{
-		if (bIsNewUserMessage)
-		{
-			// For new user messages, only include the new message (it's already added to history)
-			// Don't look for tool results - those are only relevant when continuing after tool execution
-			// The new user message was just added, so it's the last item in history
-			const int32 HistorySize = ConversationHistory.Num();
-			if (HistorySize > 0)
-			{
-				StartIndex = HistorySize - 1; // Only include the last message (the new user message)
-				// Double-check that StartIndex is valid
-				if (StartIndex < 0 || StartIndex >= HistorySize)
-				{
-					UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Calculated invalid StartIndex %d for history size %d, resetting to 0"), StartIndex, HistorySize);
-					StartIndex = 0;
-				}
-			}
-			else
-			{
-				StartIndex = 0; // Safety fallback - should not happen as we just added a message
-				UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: History is empty after adding user message, this should not happen"));
-			}
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Responses API - new user message, starting from index %d (history size: %d)"), StartIndex, ConversationHistory.Num());
-		}
-		else
-		{
-			// For tool call continuation, find tool results that need to be included
-			// Look for tool messages after the last assistant message with tool_calls
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Tool continuation - searching for tool results in history (size: %d)"), ConversationHistory.Num());
-			
-			for (int32 i = ConversationHistory.Num() - 1; i >= 0; --i)
-			{
-				if (ConversationHistory[i].Role == TEXT("assistant") && 
-					(ConversationHistory[i].ToolCallIds.Num() > 0 || !ConversationHistory[i].ToolCallsJson.IsEmpty()))
-				{
-					UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Found assistant message with tool_calls at index %d (tool_call_ids: %d)"), 
-						i, ConversationHistory[i].ToolCallIds.Num());
-					
-					// Found the assistant message with tool_calls
-					// Collect tool results that follow it
-					for (int32 j = i + 1; j < ConversationHistory.Num(); ++j)
-					{
-						if (ConversationHistory[j].Role == TEXT("tool"))
-						{
-							ToolResultsToInclude.Add(ConversationHistory[j]);
-							UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added tool result to include: call_id=%s, content_length=%d"), 
-								*ConversationHistory[j].ToolCallId, ConversationHistory[j].Content.Len());
-						}
-						else if (ConversationHistory[j].Role == TEXT("user"))
-						{
-							StartIndex = j; // Start from this user message
-							UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Found user message at index %d, stopping tool result collection"), j);
-							break;
-						}
-					}
-					break;
-				}
-			}
-			
-			// If no user message found, start from after tool results
-			if (StartIndex == 0 && ToolResultsToInclude.Num() > 0)
-			{
-				StartIndex = ConversationHistory.Num(); // Don't include any history messages, only tool results
-				UE_LOG(LogTemp, Log, TEXT("UnrealGPT: No user message found, starting from end of history (index %d)"), StartIndex);
-			}
-			
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Responses API - tool continuation, starting from index %d, will include %d tool results"), StartIndex, ToolResultsToInclude.Num());
-			
-			// Log all tool call IDs we're looking for vs what we found
-			if (ConversationHistory.Num() > 0)
-			{
-				const FAgentMessage& LastAssistantMsg = ConversationHistory[ConversationHistory.Num() - 1];
-				if (LastAssistantMsg.Role == TEXT("assistant") && LastAssistantMsg.ToolCallIds.Num() > 0)
-				{
-					UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Last assistant message has %d tool_call_ids"), LastAssistantMsg.ToolCallIds.Num());
-					for (const FString& ExpectedCallId : LastAssistantMsg.ToolCallIds)
-					{
-						bool bFound = false;
-						for (const FAgentMessage& ToolResult : ToolResultsToInclude)
-						{
-							if (ToolResult.ToolCallId == ExpectedCallId)
-							{
-								bFound = true;
-								break;
-							}
-						}
-						UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Tool call %s: %s"), *ExpectedCallId, bFound ? TEXT("FOUND") : TEXT("MISSING"));
-					}
-				}
-			}
-		}
+		FConversationContinuation Continuation = UnrealGPTConversationState::BuildResponsesApiContinuation(ConversationHistory, bIsNewUserMessage);
+		StartIndex = Continuation.StartIndex;
+		ToolResultsToInclude = MoveTemp(Continuation.ToolResultsToInclude);
 	}
 	
 	// For Responses API, add function results as input items with type "function_call_output"
@@ -728,30 +301,7 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 		
 		if (ToolResultsToInclude.Num() > 0)
 		{
-			int32 TotalSize = 0;
-			for (const FAgentMessage& ToolResult : ToolResultsToInclude)
-			{
-				// Skip tool results that are already truncated/summarized (they're already safe)
-				// But also check total size to be safe
-				int32 ResultSize = ToolResult.Content.Len();
-				if (TotalSize + ResultSize > MaxToolResultSize * 5) // Allow up to 5x max size total
-				{
-					UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Skipping tool result (size: %d) to prevent context overflow. Total size: %d"), 
-						ResultSize, TotalSize);
-					continue;
-				}
-				
-				// Create function_call_output input item
-				TSharedPtr<FJsonObject> FunctionResultObj = MakeShareable(new FJsonObject);
-				FunctionResultObj->SetStringField(TEXT("type"), TEXT("function_call_output"));
-				FunctionResultObj->SetStringField(TEXT("call_id"), ToolResult.ToolCallId);
-				FunctionResultObj->SetStringField(TEXT("output"), ToolResult.Content);
-				
-				MessagesArray.Add(MakeShareable(new FJsonValueObject(FunctionResultObj)));
-				TotalSize += ResultSize;
-				UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added function_call_output input for call_id: %s (size: %d, total: %d)"), 
-					*ToolResult.ToolCallId, ResultSize, TotalSize);
-			}
+			UnrealGPTRequestBuilder::AppendResponsesApiFunctionCallOutputs(MessagesArray, ToolResultsToInclude, MaxToolResultSize);
 		}
 		else if (UserMessage.IsEmpty())
 		{
@@ -764,40 +314,10 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 		if (ImageBase64.Num() > 0)
 		{
 			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Adding %d screenshot image(s) to Responses API input for visual analysis"), ImageBase64.Num());
-
-			// Create a message input item containing the images
-			TSharedPtr<FJsonObject> MessageInputObj = MakeShareable(new FJsonObject);
-			MessageInputObj->SetStringField(TEXT("type"), TEXT("message"));
-			MessageInputObj->SetStringField(TEXT("role"), TEXT("user"));
-
-			// Build content array with text prompt and images
-			TArray<TSharedPtr<FJsonValue>> ContentArray;
-
-			// Add a text prompt to guide the model to analyze the image
-			TSharedPtr<FJsonObject> TextContent = MakeShareable(new FJsonObject);
-			TextContent->SetStringField(TEXT("type"), TEXT("input_text"));
-			TextContent->SetStringField(TEXT("text"), TEXT("Here is the viewport screenshot you requested. Analyze what you see and describe the scene state."));
-			ContentArray.Add(MakeShareable(new FJsonValueObject(TextContent)));
-
-			for (const FString& ImageData : ImageBase64)
-			{
-				TSharedPtr<FJsonObject> ImageContent = MakeShareable(new FJsonObject);
-
-				// Detect image format from base64 header
-				const FString MimeType = ImageData.StartsWith(TEXT("/9j/")) ? TEXT("image/jpeg") : TEXT("image/png");
-
-				ImageContent->SetStringField(TEXT("type"), TEXT("input_image"));
-				ImageContent->SetStringField(
-					TEXT("image_url"),
-					FString::Printf(TEXT("data:%s;base64,%s"), *MimeType, *ImageData));
-
-				ContentArray.Add(MakeShareable(new FJsonValueObject(ImageContent)));
-				UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added input_image (%s, %d chars) to message content"), *MimeType, ImageData.Len());
-			}
-
-			MessageInputObj->SetArrayField(TEXT("content"), ContentArray);
-			MessagesArray.Add(MakeShareable(new FJsonValueObject(MessageInputObj)));
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added message with %d image(s) to Responses API input"), ImageBase64.Num());
+			UnrealGPTRequestBuilder::AppendResponsesApiImageMessage(
+				MessagesArray,
+				ImageBase64,
+				TEXT("Here is the viewport screenshot you requested. Analyze what you see and describe the scene state."));
 		}
 	}
 	
@@ -841,58 +361,7 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 			
 			if (Msg.Role == TEXT("user") && ImageBase64.Num() > 0)
 			{
-				// Multimodal content
-				TArray<TSharedPtr<FJsonValue>> ContentArray;
-				
-				TSharedPtr<FJsonObject> TextContent = MakeShareable(new FJsonObject);
-				
-				// For Responses API, use input_text; for legacy Chat Completions, use text
-				if (bUseResponsesApi)
-				{
-					TextContent->SetStringField(TEXT("type"), TEXT("input_text"));
-					TextContent->SetStringField(TEXT("text"), Msg.Content);
-				}
-				else
-				{
-					TextContent->SetStringField(TEXT("type"), TEXT("text"));
-					TextContent->SetStringField(TEXT("text"), Msg.Content);
-				}
-				
-				ContentArray.Add(MakeShareable(new FJsonValueObject(TextContent)));
-				
-				for (const FString& ImageData : ImageBase64)
-				{
-					TSharedPtr<FJsonObject> ImageContent = MakeShareable(new FJsonObject);
-
-					// Detect image format from base64 header
-					// PNG starts with iVBORw0KGgo, JPEG starts with /9j/
-					const FString MimeType = ImageData.StartsWith(TEXT("/9j/")) ? TEXT("image/jpeg") : TEXT("image/png");
-
-					if (bUseResponsesApi)
-					{
-						// OpenAI Responses API multimodal schema:
-						// { "type": "input_image", "image_url": "data:image/<type>;base64,..." }
-						ImageContent->SetStringField(TEXT("type"), TEXT("input_image"));
-						ImageContent->SetStringField(
-							TEXT("image_url"),
-							FString::Printf(TEXT("data:%s;base64,%s"), *MimeType, *ImageData));
-					}
-					else
-					{
-						// Legacy Chat Completions multimodal schema:
-						// { "type": "image_url", "image_url": { "url": "data:image/<type>;base64,..." } }
-						ImageContent->SetStringField(TEXT("type"), TEXT("image_url"));
-						TSharedPtr<FJsonObject> ImageUrl = MakeShareable(new FJsonObject);
-						ImageUrl->SetStringField(
-							TEXT("url"),
-							FString::Printf(TEXT("data:%s;base64,%s"), *MimeType, *ImageData));
-						ImageContent->SetObjectField(TEXT("image_url"), ImageUrl);
-					}
-
-					ContentArray.Add(MakeShareable(new FJsonValueObject(ImageContent)));
-				}
-				
-				MsgObj->SetArrayField(TEXT("content"), ContentArray);
+				UnrealGPTRequestBuilder::SetUserMessageWithImages(MsgObj, Msg.Content, ImageBase64, bUseResponsesApi);
 			}
 			else if (Msg.Role == TEXT("assistant") && (Msg.ToolCallIds.Num() > 0 || !Msg.ToolCallsJson.IsEmpty()))
 			{
@@ -916,52 +385,7 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 				}
 				
 				// Parse and add tool_calls array - CRITICAL: must succeed
-				bool bToolCallsAdded = false;
-				if (!Msg.ToolCallsJson.IsEmpty())
-				{
-					TSharedRef<TJsonReader<>> ToolCallsReader = TJsonReaderFactory<>::Create(Msg.ToolCallsJson);
-					TArray<TSharedPtr<FJsonValue>> ToolCallsArray;
-					if (FJsonSerializer::Deserialize(ToolCallsReader, ToolCallsArray) && ToolCallsArray.Num() > 0)
-					{
-						MsgObj->SetArrayField(TEXT("tool_calls"), ToolCallsArray);
-						bToolCallsAdded = true;
-						UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Successfully added tool_calls to assistant message. ToolCalls count: %d"), ToolCallsArray.Num());
-					}
-					else
-					{
-						// If deserialization failed, try to reconstruct from stored data
-						UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Failed to deserialize tool_calls JSON: %s. Attempting reconstruction."), *Msg.ToolCallsJson);
-					}
-				}
-				
-				// If tool_calls weren't added and we have ToolCallIds, try to reconstruct
-				if (!bToolCallsAdded && Msg.ToolCallIds.Num() > 0)
-				{
-					// Reconstruct minimal tool_calls array from ToolCallIds
-					// Note: This is a fallback - we don't have the full tool call info, but we can create a minimal structure
-					TArray<TSharedPtr<FJsonValue>> ToolCallsArray;
-					for (const FString& ToolCallId : Msg.ToolCallIds)
-					{
-						TSharedPtr<FJsonObject> ToolCallObj = MakeShareable(new FJsonObject);
-						ToolCallObj->SetStringField(TEXT("id"), ToolCallId);
-						ToolCallObj->SetStringField(TEXT("type"), TEXT("function"));
-						
-						// We don't have the function name/args, so create empty function object
-						TSharedPtr<FJsonObject> FunctionObj = MakeShareable(new FJsonObject);
-						FunctionObj->SetStringField(TEXT("name"), TEXT("unknown"));
-						FunctionObj->SetStringField(TEXT("arguments"), TEXT("{}"));
-						ToolCallObj->SetObjectField(TEXT("function"), FunctionObj);
-						
-						ToolCallsArray.Add(MakeShareable(new FJsonValueObject(ToolCallObj)));
-					}
-					
-					if (ToolCallsArray.Num() > 0)
-					{
-						MsgObj->SetArrayField(TEXT("tool_calls"), ToolCallsArray);
-						bToolCallsAdded = true;
-						UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Reconstructed tool_calls from ToolCallIds. Count: %d"), ToolCallsArray.Num());
-					}
-				}
+				const bool bToolCallsAdded = UnrealGPTRequestBuilder::TryAddToolCallsToAssistantMessage(Msg, MsgObj);
 				
 				// If we still couldn't add tool_calls, this is a critical error
 				if (!bToolCallsAdded)
@@ -984,38 +408,7 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 				}
 				
 				// For legacy API, tool messages must follow an assistant message with tool_calls
-				bool bCanAddToolMessage = false;
-				if (MessagesArray.Num() > 0)
-				{
-					const TSharedPtr<FJsonValue>& LastMsgValue = MessagesArray.Last();
-					if (LastMsgValue.IsValid() && LastMsgValue->Type == EJson::Object)
-					{
-						TSharedPtr<FJsonObject> LastMsgObj = LastMsgValue->AsObject();
-						if (LastMsgObj.IsValid())
-						{
-							FString LastRole;
-							if (LastMsgObj->TryGetStringField(TEXT("role"), LastRole))
-							{
-								if (LastRole == TEXT("assistant") && LastMsgObj->HasField(TEXT("tool_calls")))
-								{
-									bCanAddToolMessage = true;
-								}
-								else
-								{
-									UE_LOG(LogTemp, Error, TEXT("UnrealGPT: Tool message at index %d does not follow assistant message with tool_calls. Previous role: %s, has tool_calls: %d"), 
-										i, *LastRole, LastMsgObj->HasField(TEXT("tool_calls")));
-								}
-							}
-						}
-					}
-				}
-				else
-				{
-					UE_LOG(LogTemp, Error, TEXT("UnrealGPT: Tool message at index %d has no preceding messages"), i);
-				}
-				
-				// Only add tool message if it follows a valid assistant message with tool_calls
-				if (!bCanAddToolMessage)
+				if (!UnrealGPTRequestBuilder::CanAppendToolMessage(MessagesArray, i))
 				{
 					UE_LOG(LogTemp, Error, TEXT("UnrealGPT: Skipping tool message at index %d to prevent API error"), i);
 					continue;
@@ -1038,34 +431,10 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 	if (!bUseResponsesApi && ImageBase64.Num() > 0 && UserMessage.IsEmpty())
 	{
 		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Adding %d screenshot image(s) as user message for visual analysis (legacy API)"), ImageBase64.Num());
-
-		TSharedPtr<FJsonObject> ImageMsgObj = MakeShareable(new FJsonObject);
-		ImageMsgObj->SetStringField(TEXT("role"), TEXT("user"));
-
-		TArray<TSharedPtr<FJsonValue>> ContentArray;
-
-		// Add a text prompt to guide the model to analyze the image
-		TSharedPtr<FJsonObject> TextContent = MakeShareable(new FJsonObject);
-		TextContent->SetStringField(TEXT("type"), TEXT("text"));
-		TextContent->SetStringField(TEXT("text"), TEXT("Here is the viewport screenshot you requested. Please analyze what you see and describe the scene."));
-		ContentArray.Add(MakeShareable(new FJsonValueObject(TextContent)));
-
-		for (const FString& ImageData : ImageBase64)
-		{
-			TSharedPtr<FJsonObject> ImageContent = MakeShareable(new FJsonObject);
-			const FString MimeType = ImageData.StartsWith(TEXT("/9j/")) ? TEXT("image/jpeg") : TEXT("image/png");
-
-			ImageContent->SetStringField(TEXT("type"), TEXT("image_url"));
-			TSharedPtr<FJsonObject> ImageUrl = MakeShareable(new FJsonObject);
-			ImageUrl->SetStringField(TEXT("url"), FString::Printf(TEXT("data:%s;base64,%s"), *MimeType, *ImageData));
-			ImageContent->SetObjectField(TEXT("image_url"), ImageUrl);
-
-			ContentArray.Add(MakeShareable(new FJsonValueObject(ImageContent)));
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added image_url (%s, %d chars) to user message"), *MimeType, ImageData.Len());
-		}
-
-		ImageMsgObj->SetArrayField(TEXT("content"), ContentArray);
-		MessagesArray.Add(MakeShareable(new FJsonValueObject(ImageMsgObj)));
+		UnrealGPTRequestBuilder::AppendLegacyImageMessage(
+			MessagesArray,
+			ImageBase64,
+			TEXT("Here is the viewport screenshot you requested. Please analyze what you see and describe the scene."));
 	}
 
 	const FString ConversationFieldName = IsUsingResponsesApi() ? TEXT("input") : TEXT("messages");
@@ -1116,13 +485,12 @@ void UUnrealGPTAgentClient::SendMessage(const FString& UserMessage, const TArray
 	LastRequestBody = RequestBody;
 
 	// Create HTTP request
-	CurrentRequest = CreateHttpRequest();
-	CurrentRequest->SetURL(GetEffectiveApiUrl());
-	CurrentRequest->SetVerb(TEXT("POST"));
-	CurrentRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-	CurrentRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *Settings->ApiKey));
-	CurrentRequest->SetContentAsString(RequestBody);
-	CurrentRequest->OnProcessRequestComplete().BindUObject(this, &UUnrealGPTAgentClient::OnResponseReceived);
+	CurrentRequest = UnrealGPTHttpClient::BuildJsonPost(
+		CreateHttpRequest(),
+		GetEffectiveApiUrl(),
+		Settings->ApiKey,
+		RequestBody,
+		this);
 
 	bRequestInProgress = true;
 	RequestStartTime = FPlatformTime::Seconds();
@@ -1288,19 +656,15 @@ void UUnrealGPTAgentClient::OnResponseReceived(FHttpRequestPtr Request, FHttpRes
 			{
 				if (!LastRequestBody.IsEmpty())
 				{
-					TSharedRef<IHttpRequest> RetryRequest = CreateHttpRequest();
-					RetryRequest->SetURL(GetEffectiveApiUrl());
-					RetryRequest->SetVerb(TEXT("POST"));
-					RetryRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-
 					UUnrealGPTSettings* SafeSettings = GetMutableDefault<UUnrealGPTSettings>();
-					if (SafeSettings && !SafeSettings->ApiKey.IsEmpty())
-					{
-						RetryRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *SafeSettings->ApiKey));
-					}
+					const FString ApiKey = SafeSettings ? SafeSettings->ApiKey : FString();
 
-					RetryRequest->SetContentAsString(LastRequestBody);
-					RetryRequest->OnProcessRequestComplete().BindUObject(this, &UUnrealGPTAgentClient::OnResponseReceived);
+					TSharedRef<IHttpRequest> RetryRequest = UnrealGPTHttpClient::BuildJsonPost(
+						CreateHttpRequest(),
+						GetEffectiveApiUrl(),
+						ApiKey,
+						LastRequestBody,
+						this);
 
 					bRequestInProgress = true;
 					RequestStartTime = FPlatformTime::Seconds();
@@ -1335,45 +699,7 @@ void UUnrealGPTAgentClient::OnResponseReceived(FHttpRequestPtr Request, FHttpRes
 		{
 			RateLimitRetryCount++;
 
-			// Parse the error to extract retry delay if provided
-			float RetryDelaySeconds = 1.0f; // Default 1 second
-			TSharedPtr<FJsonObject> ErrorRoot;
-			TSharedRef<TJsonReader<>> ErrorReader = TJsonReaderFactory<>::Create(ErrorBody);
-			if (FJsonSerializer::Deserialize(ErrorReader, ErrorRoot) && ErrorRoot.IsValid())
-			{
-				const TSharedPtr<FJsonObject>* ErrorObjPtr = nullptr;
-				if (ErrorRoot->TryGetObjectField(TEXT("error"), ErrorObjPtr) && ErrorObjPtr && (*ErrorObjPtr).IsValid())
-				{
-					FString Message;
-					(*ErrorObjPtr)->TryGetStringField(TEXT("message"), Message);
-
-					// Try to extract delay from message like "Please try again in 589ms"
-					int32 MsIndex = Message.Find(TEXT("in "));
-					if (MsIndex != INDEX_NONE)
-					{
-						FString DelayPart = Message.Mid(MsIndex + 3);
-						if (DelayPart.Contains(TEXT("ms")))
-						{
-							int32 DelayMs = FCString::Atoi(*DelayPart);
-							if (DelayMs > 0)
-							{
-								RetryDelaySeconds = FMath::Max(0.5f, DelayMs / 1000.0f + 0.1f); // Add 100ms buffer
-							}
-						}
-						else if (DelayPart.Contains(TEXT("s")))
-						{
-							float DelayS = FCString::Atof(*DelayPart);
-							if (DelayS > 0)
-							{
-								RetryDelaySeconds = DelayS + 0.1f; // Add 100ms buffer
-							}
-						}
-					}
-				}
-			}
-
-			// Cap retry delay to prevent excessively long waits
-			RetryDelaySeconds = FMath::Clamp(RetryDelaySeconds, 0.5f, 30.0f);
+			float RetryDelaySeconds = UnrealGPTRetryPolicy::ParseRetryDelaySeconds(ErrorBody);
 
 			UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Rate limited (429). Retry %d/%d in %.2f seconds..."), RateLimitRetryCount, MaxRateLimitRetries, RetryDelaySeconds);
 
@@ -1382,19 +708,15 @@ void UUnrealGPTAgentClient::OnResponseReceived(FHttpRequestPtr Request, FHttpRes
 			{
 				if (!LastRequestBody.IsEmpty())
 				{
-					TSharedRef<IHttpRequest> RetryRequest = CreateHttpRequest();
-					RetryRequest->SetURL(GetEffectiveApiUrl());
-					RetryRequest->SetVerb(TEXT("POST"));
-					RetryRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-
 					UUnrealGPTSettings* SafeSettings = GetMutableDefault<UUnrealGPTSettings>();
-					if (SafeSettings && !SafeSettings->ApiKey.IsEmpty())
-					{
-						RetryRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *SafeSettings->ApiKey));
-					}
+					const FString ApiKey = SafeSettings ? SafeSettings->ApiKey : FString();
 
-					RetryRequest->SetContentAsString(LastRequestBody);
-					RetryRequest->OnProcessRequestComplete().BindUObject(this, &UUnrealGPTAgentClient::OnResponseReceived);
+					TSharedRef<IHttpRequest> RetryRequest = UnrealGPTHttpClient::BuildJsonPost(
+						CreateHttpRequest(),
+						GetEffectiveApiUrl(),
+						ApiKey,
+						LastRequestBody,
+						this);
 
 					bRequestInProgress = true;
 					RequestStartTime = FPlatformTime::Seconds();
@@ -1449,13 +771,12 @@ void UUnrealGPTAgentClient::OnResponseReceived(FHttpRequestPtr Request, FHttpRes
 									TSharedRef<TJsonWriter<>> NewWriter = TJsonWriterFactory<>::Create(&NewBody);
 									if (FJsonSerializer::Serialize(OriginalJson.ToSharedRef(), NewWriter))
 									{
-										TSharedRef<IHttpRequest> RetryRequest = CreateHttpRequest();
-										RetryRequest->SetURL(GetEffectiveApiUrl());
-										RetryRequest->SetVerb(TEXT("POST"));
-										RetryRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-										RetryRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *Settings->ApiKey));
-										RetryRequest->SetContentAsString(NewBody);
-										RetryRequest->OnProcessRequestComplete().BindUObject(this, &UUnrealGPTAgentClient::OnResponseReceived);
+										TSharedRef<IHttpRequest> RetryRequest = UnrealGPTHttpClient::BuildJsonPost(
+											CreateHttpRequest(),
+											GetEffectiveApiUrl(),
+											Settings->ApiKey,
+											NewBody,
+											this);
 
 										bRequestInProgress = true;
 										RequestStartTime = FPlatformTime::Seconds();
@@ -1478,8 +799,8 @@ void UUnrealGPTAgentClient::OnResponseReceived(FHttpRequestPtr Request, FHttpRes
 	RateLimitRetryCount = 0;
 
 	// Log successful request/response pair to conversation history file
-	LogApiConversation(ConversationSessionId, TEXT("request"), LastRequestBody);
-	LogApiConversation(ConversationSessionId, TEXT("response"), ResponseBody, ResponseCode);
+	UnrealGPTTelemetry::LogApiConversation(ConversationSessionId, TEXT("request"), LastRequestBody);
+	UnrealGPTTelemetry::LogApiConversation(ConversationSessionId, TEXT("response"), ResponseBody, ResponseCode);
 
 	// Use ResponseBody which was already retrieved above
 	const FString& ResponseContent = ResponseBody;
@@ -1502,177 +823,72 @@ void UUnrealGPTAgentClient::OnResponseReceived(FHttpRequestPtr Request, FHttpRes
 
 void UUnrealGPTAgentClient::ProcessStreamingResponse(const FString& ResponseContent)
 {
-	// Parse streaming response (SSE format)
-	TArray<FString> Lines;
-	ResponseContent.ParseIntoArrayLines(Lines);
+	FStreamingParseResult ParseResult;
+	UnrealGPTResponseParser::ParseChatCompletionsSse(ResponseContent, ParseResult);
 
-	FString AccumulatedContent;
-	FString CurrentToolCallId;
-	FString CurrentToolName;
-	FString CurrentToolArguments;
-
-	for (const FString& Line : Lines)
+	if (ParseResult.FinishReason == TEXT("tool_calls") && !ParseResult.ToolCallId.IsEmpty())
 	{
-		if (Line.StartsWith(TEXT("data: ")))
+		// Build tool_calls JSON for assistant message
+		TSharedPtr<FJsonObject> ToolCallObj = MakeShareable(new FJsonObject);
+		ToolCallObj->SetStringField(TEXT("id"), ParseResult.ToolCallId);
+		ToolCallObj->SetStringField(TEXT("type"), TEXT("function"));
+
+		TSharedPtr<FJsonObject> FunctionObj = MakeShareable(new FJsonObject);
+		FunctionObj->SetStringField(TEXT("name"), ParseResult.ToolName);
+		FunctionObj->SetStringField(TEXT("arguments"), ParseResult.ToolArguments);
+		ToolCallObj->SetObjectField(TEXT("function"), FunctionObj);
+
+		TArray<TSharedPtr<FJsonValue>> ToolCallsArray;
+		ToolCallsArray.Add(MakeShareable(new FJsonValueObject(ToolCallObj)));
+
+		FString ToolCallsJsonString;
+		TSharedRef<TJsonWriter<>> ToolCallsWriter = TJsonWriterFactory<>::Create(&ToolCallsJsonString);
+		const bool bSerialized = FJsonSerializer::Serialize(ToolCallsArray, ToolCallsWriter);
+
+		if (!bSerialized || ToolCallsJsonString.IsEmpty())
 		{
-			FString Data = Line.Mid(6); // Remove "data: "
-			if (Data == TEXT("[DONE]"))
-			{
-				break;
-			}
-
-			TSharedPtr<FJsonObject> JsonObject;
-			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Data);
-			if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
-			{
-				// Check for choices array
-				const TArray<TSharedPtr<FJsonValue>>* ChoicesArray;
-				if (JsonObject->TryGetArrayField(TEXT("choices"), ChoicesArray) && ChoicesArray->Num() > 0)
-				{
-					const TSharedPtr<FJsonObject>* ChoiceObj;
-					if ((*ChoicesArray)[0]->TryGetObject(ChoiceObj))
-					{
-						const TSharedPtr<FJsonObject>* DeltaObj;
-						if ((*ChoiceObj)->TryGetObjectField(TEXT("delta"), DeltaObj))
-						{
-							// Content delta
-							FString ContentDelta;
-							if ((*DeltaObj)->TryGetStringField(TEXT("content"), ContentDelta))
-							{
-								AccumulatedContent += ContentDelta;
-							}
-
-							// Tool calls delta
-							const TArray<TSharedPtr<FJsonValue>>* ToolCallsArray;
-							if ((*DeltaObj)->TryGetArrayField(TEXT("tool_calls"), ToolCallsArray))
-							{
-								for (const TSharedPtr<FJsonValue>& ToolCallValue : *ToolCallsArray)
-								{
-									const TSharedPtr<FJsonObject>* ToolCallObj;
-									if (ToolCallValue->TryGetObject(ToolCallObj))
-									{
-										(*ToolCallObj)->TryGetStringField(TEXT("id"), CurrentToolCallId);
-										
-										const TSharedPtr<FJsonObject>* FunctionObj;
-										if ((*ToolCallObj)->TryGetObjectField(TEXT("function"), FunctionObj))
-										{
-											(*FunctionObj)->TryGetStringField(TEXT("name"), CurrentToolName);
-											
-											FString ArgumentsDelta;
-											if ((*FunctionObj)->TryGetStringField(TEXT("arguments"), ArgumentsDelta))
-											{
-												CurrentToolArguments += ArgumentsDelta;
-											}
-										}
-									}
-								}
-							}
-						}
-
-						// Check if finished
-						FString FinishReason;
-						if ((*ChoiceObj)->TryGetStringField(TEXT("finish_reason"), FinishReason))
-						{
-							if (FinishReason == TEXT("tool_calls") && !CurrentToolCallId.IsEmpty())
-							{
-								// Build tool_calls JSON for assistant message
-								TSharedPtr<FJsonObject> ToolCallObj = MakeShareable(new FJsonObject);
-								ToolCallObj->SetStringField(TEXT("id"), CurrentToolCallId);
-								ToolCallObj->SetStringField(TEXT("type"), TEXT("function"));
-								
-								TSharedPtr<FJsonObject> FunctionObj = MakeShareable(new FJsonObject);
-								FunctionObj->SetStringField(TEXT("name"), CurrentToolName);
-								FunctionObj->SetStringField(TEXT("arguments"), CurrentToolArguments);
-								ToolCallObj->SetObjectField(TEXT("function"), FunctionObj);
-
-								TArray<TSharedPtr<FJsonValue>> ToolCallsArray;
-								ToolCallsArray.Add(MakeShareable(new FJsonValueObject(ToolCallObj)));
-
-								FString ToolCallsJsonString;
-								TSharedRef<TJsonWriter<>> ToolCallsWriter = TJsonWriterFactory<>::Create(&ToolCallsJsonString);
-								bool bSerialized = FJsonSerializer::Serialize(ToolCallsArray, ToolCallsWriter);
-								
-								if (!bSerialized || ToolCallsJsonString.IsEmpty())
-								{
-									UE_LOG(LogTemp, Error, TEXT("UnrealGPT: Failed to serialize tool_calls array"));
-								}
-								else
-								{
-									UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Serialized tool_calls: %s"), *ToolCallsJsonString);
-								}
-
-								// Add assistant message with tool_calls to history FIRST
-								FAgentMessage AssistantMsg;
-								AssistantMsg.Role = TEXT("assistant");
-								AssistantMsg.Content = AccumulatedContent;
-								AssistantMsg.ToolCallIds.Add(CurrentToolCallId);
-								AssistantMsg.ToolCallsJson = ToolCallsJsonString;
-								ConversationHistory.Add(AssistantMsg);
-								
-								UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added assistant message with tool_calls to history. History size: %d"), ConversationHistory.Num());
-
-								OnAgentMessage.Broadcast(TEXT("assistant"), AccumulatedContent, TArray<FString>{CurrentToolCallId});
-
-								// Execute tool call
-								FString ToolResult = ExecuteToolCall(CurrentToolName, CurrentToolArguments);
-								
-								// Truncate or summarize large tool results to prevent context window overflow
-								FString ToolResultForHistory = ToolResult;
-								const bool bIsScreenshot = (CurrentToolName == TEXT("viewport_screenshot"));
-								if (ToolResultForHistory.Len() > MaxToolResultSize)
-								{
-									// Check for both PNG (iVBORw0KGgo) and JPEG (/9j/) base64 headers
-									const bool bIsBase64Image = ToolResultForHistory.StartsWith(TEXT("iVBORw0KGgo")) || ToolResultForHistory.StartsWith(TEXT("/9j/"));
-									if (bIsScreenshot && bIsBase64Image)
-									{
-										ToolResultForHistory = TEXT("Screenshot captured successfully. [Base64 image data omitted from history to prevent context overflow - ")
-											TEXT("the image was captured and can be viewed in the UI. Length: ") + FString::FromInt(ToolResult.Len()) + TEXT(" characters]");
-										UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Truncated large screenshot result (%d chars) to prevent context overflow"), ToolResult.Len());
-									}
-									else
-									{
-										ToolResultForHistory = ToolResultForHistory.Left(MaxToolResultSize) + 
-											TEXT("\n\n[Result truncated - original length: ") + FString::FromInt(ToolResult.Len()) + 
-											TEXT(" characters. Full result available in tool output.]");
-										UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Truncated large tool result (%d chars) to prevent context overflow"), ToolResult.Len());
-									}
-								}
-								
-								// Add tool result to conversation (truncated version)
-								FAgentMessage ToolMsg;
-								ToolMsg.Role = TEXT("tool");
-								ToolMsg.Content = ToolResultForHistory;
-								ToolMsg.ToolCallId = CurrentToolCallId;
-								ConversationHistory.Add(ToolMsg);
-
-								OnToolResult.Broadcast(CurrentToolCallId, ToolResult);
-
-								// Continue conversation with tool result.
-								// If this was a viewport_screenshot call, also forward the image as multimodal input
-								// so the model can analyze the actual viewport image (not just a text summary).
-								TArray<FString> ScreenshotImages;
-								if (bIsScreenshot && !ToolResult.IsEmpty())
-								{
-									ScreenshotImages.Add(ToolResult);
-								}
-
-								SendMessage(TEXT(""), ScreenshotImages);
-							}
-							else if (!AccumulatedContent.IsEmpty())
-							{
-								// Add assistant message to history
-								FAgentMessage AssistantMsg;
-								AssistantMsg.Role = TEXT("assistant");
-								AssistantMsg.Content = AccumulatedContent;
-								ConversationHistory.Add(AssistantMsg);
-
-								OnAgentMessage.Broadcast(TEXT("assistant"), AccumulatedContent, TArray<FString>());
-							}
-						}
-					}
-				}
-			}
+			UE_LOG(LogTemp, Error, TEXT("UnrealGPT: Failed to serialize tool_calls array"));
 		}
+		else
+		{
+			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Serialized tool_calls: %s"), *ToolCallsJsonString);
+		}
+
+		// Add assistant message with tool_calls to history FIRST
+		FAgentMessage AssistantMsg = UnrealGPTConversationState::CreateAssistantToolCallMessage(
+			ParseResult.AccumulatedContent,
+			TArray<FString>{ParseResult.ToolCallId},
+			ToolCallsJsonString);
+		UnrealGPTConversationState::AppendMessage(ConversationHistory, AssistantMsg);
+
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Added assistant message with tool_calls to history. History size: %d"), ConversationHistory.Num());
+
+		UnrealGPTNotifier::BroadcastAgentMessage(this, ParseResult.AccumulatedContent, TArray<FString>{ParseResult.ToolCallId});
+
+		// Execute tool call
+		FString ToolResult = ExecuteToolCall(ParseResult.ToolName, ParseResult.ToolArguments);
+
+		FProcessedToolResult ProcessedToolResult =
+			UnrealGPTToolResultProcessor::ProcessResult(ParseResult.ToolName, ToolResult, MaxToolResultSize);
+
+		// Add tool result to conversation (truncated version)
+		FAgentMessage ToolMsg = UnrealGPTConversationState::CreateToolMessage(ProcessedToolResult.ResultForHistory, ParseResult.ToolCallId);
+		UnrealGPTConversationState::AppendMessage(ConversationHistory, ToolMsg);
+
+		UnrealGPTNotifier::BroadcastToolResult(this, ParseResult.ToolCallId, ToolResult);
+
+		// Continue conversation with tool result.
+		// If this was a viewport_screenshot call, also forward the image as multimodal input
+		// so the model can analyze the actual viewport image (not just a text summary).
+		SendMessage(TEXT(""), ProcessedToolResult.Images);
+	}
+	else if (!ParseResult.AccumulatedContent.IsEmpty())
+	{
+		// Add assistant message to history
+		FAgentMessage AssistantMsg = UnrealGPTConversationState::CreateAssistantMessage(ParseResult.AccumulatedContent);
+		UnrealGPTConversationState::AppendMessage(ConversationHistory, AssistantMsg);
+
+		UnrealGPTNotifier::BroadcastAgentMessage(this, ParseResult.AccumulatedContent, TArray<FString>());
 	}
 }
 
@@ -1721,7 +937,7 @@ void UUnrealGPTAgentClient::ProcessResponsesApiResponse(const FString& ResponseC
 		if ((*ReasoningObjPtr)->TryGetStringField(TEXT("summary"), ReasoningSummary) && !ReasoningSummary.IsEmpty())
 		{
 			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Received reasoning summary (length: %d)"), ReasoningSummary.Len());
-			OnAgentReasoning.Broadcast(ReasoningSummary);
+			UnrealGPTNotifier::BroadcastAgentReasoning(this, ReasoningSummary);
 		}
 	}
 
@@ -1744,27 +960,47 @@ void UUnrealGPTAgentClient::ProcessResponsesApiResponse(const FString& ResponseC
 	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Found output array with %d items"), OutputArray->Num());
 
 	// Extract tool calls and text from output array using helper method
-	TArray<FToolCallInfo> ToolCalls;
-	FString AccumulatedText;
-	ExtractFromResponseOutput(*OutputArray, ToolCalls, AccumulatedText);
+	FResponseParseResult ParseResult;
+	UnrealGPTResponseParser::ExtractFromResponseOutput(*OutputArray, ParseResult);
+
+	if (ParseResult.ReasoningChunks.Num() > 0)
+	{
+		for (const FString& ReasoningChunk : ParseResult.ReasoningChunks)
+		{
+			if (!ReasoningChunk.IsEmpty())
+			{
+				UnrealGPTNotifier::BroadcastAgentReasoning(this, ReasoningChunk);
+			}
+		}
+	}
+
+	if (ParseResult.ServerSideToolCalls.Num() > 0)
+	{
+		for (const FServerSideToolCall& ServerSideCall : ParseResult.ServerSideToolCalls)
+		{
+			UnrealGPTNotifier::BroadcastToolCall(this, ServerSideCall.ToolName, ServerSideCall.ArgsJson);
+			if (!ServerSideCall.ResultSummary.IsEmpty())
+			{
+				UnrealGPTNotifier::BroadcastToolResult(this, ServerSideCall.CallId, ServerSideCall.ResultSummary);
+			}
+		}
+	}
 
 	// Process the extracted tool calls and/or text
-	if (ToolCalls.Num() > 0)
+	if (ParseResult.ToolCalls.Num() > 0)
 	{
-		ProcessExtractedToolCalls(ToolCalls, AccumulatedText);
+		ProcessExtractedToolCalls(ParseResult.ToolCalls, ParseResult.AccumulatedText);
 		return;
 	}
 
 	// No tool calls - just process the text response
-	if (!AccumulatedText.IsEmpty())
+	if (!ParseResult.AccumulatedText.IsEmpty())
 	{
 		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Processing regular assistant message (no tool calls)"));
-		FAgentMessage AssistantMsg;
-		AssistantMsg.Role = TEXT("assistant");
-		AssistantMsg.Content = AccumulatedText;
-		ConversationHistory.Add(AssistantMsg);
+		FAgentMessage AssistantMsg = UnrealGPTConversationState::CreateAssistantMessage(ParseResult.AccumulatedText);
+		UnrealGPTConversationState::AppendMessage(ConversationHistory, AssistantMsg);
 
-		OnAgentMessage.Broadcast(TEXT("assistant"), AccumulatedText, TArray<FString>());
+		UnrealGPTNotifier::BroadcastAgentMessage(this, ParseResult.AccumulatedText, TArray<FString>());
 		ToolCallIterationCount = 0;
 	}
 	else
@@ -1772,332 +1008,6 @@ void UUnrealGPTAgentClient::ProcessResponsesApiResponse(const FString& ResponseC
 		UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Message output had no text content and no tool calls"));
 		ToolCallIterationCount = 0;
 	}
-}
-
-void UUnrealGPTAgentClient::ExtractFromResponseOutput(const TArray<TSharedPtr<FJsonValue>>& OutputArray, TArray<FToolCallInfo>& OutToolCalls, FString& OutAccumulatedText)
-{
-	for (int32 i = 0; i < OutputArray.Num(); ++i)
-	{
-		const TSharedPtr<FJsonValue>& OutputValue = OutputArray[i];
-		TSharedPtr<FJsonObject> OutputObj = OutputValue.IsValid() ? OutputValue->AsObject() : nullptr;
-		if (!OutputObj.IsValid())
-		{
-			UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: Output item %d is not a valid object"), i);
-			continue;
-		}
-
-		FString OutputType;
-		OutputObj->TryGetStringField(TEXT("type"), OutputType);
-		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Output item %d type: %s"), i, *OutputType);
-
-		if (OutputType == TEXT("function_call"))
-		{
-			// Direct function_call output item
-			FToolCallInfo Info;
-
-			// Try different possible field names for the function call ID
-			if (!OutputObj->TryGetStringField(TEXT("call_id"), Info.Id))
-			{
-				if (!OutputObj->TryGetStringField(TEXT("id"), Info.Id))
-				{
-					OutputObj->TryGetStringField(TEXT("function_call_id"), Info.Id);
-				}
-			}
-
-			// Try to get function information
-			const TSharedPtr<FJsonObject>* FunctionObjPtr = nullptr;
-			if (OutputObj->TryGetObjectField(TEXT("function"), FunctionObjPtr) && FunctionObjPtr && FunctionObjPtr->IsValid())
-			{
-				(*FunctionObjPtr)->TryGetStringField(TEXT("name"), Info.Name);
-				(*FunctionObjPtr)->TryGetStringField(TEXT("arguments"), Info.Arguments);
-			}
-			else
-			{
-				// Try direct fields on the output object
-				OutputObj->TryGetStringField(TEXT("name"), Info.Name);
-				OutputObj->TryGetStringField(TEXT("function_name"), Info.Name);
-				OutputObj->TryGetStringField(TEXT("arguments"), Info.Arguments);
-				OutputObj->TryGetStringField(TEXT("function_arguments"), Info.Arguments);
-			}
-
-			if (!Info.Id.IsEmpty() && !Info.Name.IsEmpty())
-			{
-				OutToolCalls.Add(Info);
-				UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Found function call - id: %s, name: %s"), *Info.Id, *Info.Name);
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: function_call output missing required fields - id: '%s', name: '%s'"), *Info.Id, *Info.Name);
-			}
-		}
-		else if (OutputType == TEXT("file_search_call") || OutputType == TEXT("web_search_call"))
-		{
-			// Handle specialized OpenAI-hosted search tools (server-side only)
-			const bool bIsFileSearch = (OutputType == TEXT("file_search_call"));
-			const FString ToolName = bIsFileSearch ? TEXT("file_search") : TEXT("web_search");
-
-			FString CallId;
-			if (!OutputObj->TryGetStringField(TEXT("call_id"), CallId))
-			{
-				OutputObj->TryGetStringField(TEXT("id"), CallId);
-			}
-
-			// Build a compact arguments JSON object for the UI (queries, status, etc.)
-			// Note: In the Responses API, queries/results are at the TOP LEVEL of the output object,
-			// not nested inside a "file_search" or "web_search" sub-object.
-			TSharedPtr<FJsonObject> ArgsJson = MakeShareable(new FJsonObject);
-
-			// Also extract results for UI display
-			FString ResultSummary;
-			int32 ResultCount = 0;
-
-			// Copy relevant fields to ArgsJson for UI display (skip results, we summarize separately)
-			for (const auto& Pair : OutputObj->Values)
-			{
-				if (Pair.Key != TEXT("results") && Pair.Key != TEXT("type") && Pair.Key != TEXT("id"))
-				{
-					ArgsJson->SetField(Pair.Key, Pair.Value);
-				}
-			}
-
-			// Extract results array (at top level of OutputObj)
-			const TArray<TSharedPtr<FJsonValue>>* ResultsArray = nullptr;
-			if (OutputObj->TryGetArrayField(TEXT("results"), ResultsArray) && ResultsArray)
-			{
-				ResultCount = ResultsArray->Num();
-				if (ResultCount > 0)
-				{
-					ResultSummary = FString::Printf(TEXT("Found %d result(s):\n\n"), ResultCount);
-
-					// Show up to 3 results with snippets
-					const int32 MaxToShow = FMath::Min(3, ResultCount);
-					for (int32 ResultIdx = 0; ResultIdx < MaxToShow; ++ResultIdx)
-					{
-						const TSharedPtr<FJsonObject> ResultObj = (*ResultsArray)[ResultIdx]->AsObject();
-						if (!ResultObj.IsValid()) continue;
-
-						FString FileName;
-						ResultObj->TryGetStringField(TEXT("filename"), FileName);
-						if (FileName.IsEmpty())
-						{
-							ResultObj->TryGetStringField(TEXT("name"), FileName);
-						}
-						if (FileName.IsEmpty())
-						{
-							ResultObj->TryGetStringField(TEXT("file_id"), FileName);
-						}
-						if (FileName.IsEmpty())
-						{
-							ResultObj->TryGetStringField(TEXT("id"), FileName);
-						}
-
-						// Try to get text snippet
-						FString Snippet;
-						const TArray<TSharedPtr<FJsonValue>>* TextArray = nullptr;
-						if (ResultObj->TryGetArrayField(TEXT("text"), TextArray) && TextArray && TextArray->Num() > 0)
-						{
-							// Text is often an array of content blocks
-							for (const auto& TextVal : *TextArray)
-							{
-								const TSharedPtr<FJsonObject> TextObj = TextVal->AsObject();
-								if (TextObj.IsValid())
-								{
-									FString TextContent;
-									if (TextObj->TryGetStringField(TEXT("text"), TextContent) && !TextContent.IsEmpty())
-									{
-										Snippet = TextContent.Left(150);
-										if (TextContent.Len() > 150) Snippet += TEXT("...");
-										break;
-									}
-								}
-							}
-						}
-						// Also try "content" arrays (Responses API blocks), then direct fields
-						if (Snippet.IsEmpty())
-						{
-							const TArray<TSharedPtr<FJsonValue>>* ContentArray = nullptr;
-							if (ResultObj->TryGetArrayField(TEXT("content"), ContentArray) && ContentArray && ContentArray->Num() > 0)
-							{
-								for (const auto& ContentVal : *ContentArray)
-								{
-									if (!ContentVal.IsValid())
-									{
-										continue;
-									}
-
-									FString ContentText;
-									if (ContentVal->Type == EJson::String && ContentVal->TryGetString(ContentText) && !ContentText.IsEmpty())
-									{
-										Snippet = ContentText;
-									}
-									else
-									{
-										const TSharedPtr<FJsonObject> ContentObj = ContentVal->AsObject();
-										if (ContentObj.IsValid())
-										{
-											if (ContentObj->TryGetStringField(TEXT("text"), ContentText) && !ContentText.IsEmpty())
-											{
-												Snippet = ContentText;
-											}
-											else if (ContentObj->TryGetStringField(TEXT("content"), ContentText) && !ContentText.IsEmpty())
-											{
-												Snippet = ContentText;
-											}
-											else if (ContentObj->TryGetStringField(TEXT("value"), ContentText) && !ContentText.IsEmpty())
-											{
-												Snippet = ContentText;
-											}
-										}
-									}
-
-									if (!Snippet.IsEmpty())
-									{
-										break;
-									}
-								}
-							}
-
-							if (Snippet.IsEmpty())
-							{
-								ResultObj->TryGetStringField(TEXT("text"), Snippet);
-							}
-							if (Snippet.IsEmpty())
-							{
-								ResultObj->TryGetStringField(TEXT("content"), Snippet);
-							}
-							if (Snippet.IsEmpty())
-							{
-								ResultObj->TryGetStringField(TEXT("snippet"), Snippet);
-							}
-							if (!Snippet.IsEmpty() && Snippet.Len() > 150)
-							{
-								Snippet = Snippet.Left(150) + TEXT("...");
-							}
-						}
-
-						// Optional relevance score if present
-						double ScoreValue = 0.0;
-						const bool bHasScore = ResultObj->TryGetNumberField(TEXT("score"), ScoreValue);
-						const FString ScoreSuffix = bHasScore
-							? FString::Printf(TEXT(" (score %.3f)"), ScoreValue)
-							: TEXT("");
-
-						ResultSummary += FString::Printf(TEXT("%d. %s%s\n"), ResultIdx + 1,
-							FileName.IsEmpty() ? TEXT("(unnamed)") : *FileName,
-							*ScoreSuffix);
-						if (!Snippet.IsEmpty())
-						{
-							ResultSummary += FString::Printf(TEXT("   %s\n"), *Snippet);
-						}
-						ResultSummary += TEXT("\n");
-					}
-
-					if (ResultCount > MaxToShow)
-					{
-						ResultSummary += FString::Printf(TEXT("... and %d more result(s)"), ResultCount - MaxToShow);
-					}
-				}
-				else
-				{
-					ResultSummary = TEXT("No results found.");
-				}
-			}
-
-			// Check status field (at top level)
-			FString Status;
-			OutputObj->TryGetStringField(TEXT("status"), Status);
-
-			FString ArgsString;
-			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ArgsString);
-			FJsonSerializer::Serialize(ArgsJson.ToSharedRef(), Writer);
-
-			// Broadcast tool call to UI
-			if (IsInGameThread())
-			{
-				OnToolCall.Broadcast(ToolName, ArgsString);
-				// Also broadcast results if we have them
-				if (!ResultSummary.IsEmpty())
-				{
-					OnToolResult.Broadcast(CallId, ResultSummary);
-				}
-			}
-			else
-			{
-				AsyncTask(ENamedThreads::GameThread, [this, ToolName, ArgsString, CallId, ResultSummary]()
-				{
-					OnToolCall.Broadcast(ToolName, ArgsString);
-					if (!ResultSummary.IsEmpty())
-					{
-						OnToolResult.Broadcast(CallId, ResultSummary);
-					}
-				});
-			}
-
-			UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Server-side %s - status: %s, results: %d"), *ToolName, *Status, ResultCount);
-			// NOTE: NOT adding to OutToolCalls - these are server-side only
-		}
-		else if (OutputType == TEXT("message"))
-		{
-			// Message output with content array
-			const TArray<TSharedPtr<FJsonValue>>* ContentArray = nullptr;
-			if (!OutputObj->TryGetArrayField(TEXT("content"), ContentArray) || !ContentArray)
-			{
-				continue;
-			}
-
-			for (const TSharedPtr<FJsonValue>& ContentValue : *ContentArray)
-			{
-				TSharedPtr<FJsonObject> ContentObj = ContentValue.IsValid() ? ContentValue->AsObject() : nullptr;
-				if (!ContentObj.IsValid())
-				{
-					continue;
-				}
-
-				FString ContentType;
-				ContentObj->TryGetStringField(TEXT("type"), ContentType);
-
-				if (ContentType == TEXT("output_text") || ContentType == TEXT("text"))
-				{
-					FString TextChunk;
-					if (ContentObj->TryGetStringField(TEXT("text"), TextChunk))
-					{
-						OutAccumulatedText += TextChunk;
-					}
-				}
-				else if (ContentType == TEXT("reasoning") || ContentType == TEXT("thought"))
-				{
-					FString ReasoningChunk;
-					if (ContentObj->TryGetStringField(TEXT("text"), ReasoningChunk))
-					{
-						OnAgentReasoning.Broadcast(ReasoningChunk);
-					}
-				}
-				else if (ContentType == TEXT("tool_call"))
-				{
-					const TSharedPtr<FJsonObject>* ToolCallObjPtr = nullptr;
-					if (ContentObj->TryGetObjectField(TEXT("tool_call"), ToolCallObjPtr) && ToolCallObjPtr && ToolCallObjPtr->IsValid())
-					{
-						FToolCallInfo Info;
-						(*ToolCallObjPtr)->TryGetStringField(TEXT("id"), Info.Id);
-
-						const TSharedPtr<FJsonObject>* FuncObjPtr = nullptr;
-						if ((*ToolCallObjPtr)->TryGetObjectField(TEXT("function"), FuncObjPtr) && FuncObjPtr && FuncObjPtr->IsValid())
-						{
-							(*FuncObjPtr)->TryGetStringField(TEXT("name"), Info.Name);
-							(*FuncObjPtr)->TryGetStringField(TEXT("arguments"), Info.Arguments);
-						}
-
-						if (!Info.Id.IsEmpty() && !Info.Name.IsEmpty())
-						{
-							OutToolCalls.Add(MoveTemp(Info));
-						}
-					}
-				}
-			}
-		}
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Extracted %d tool calls, %d chars of text"), OutToolCalls.Num(), OutAccumulatedText.Len());
 }
 
 void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo>& ToolCalls, const FString& AccumulatedText)
@@ -2123,27 +1033,30 @@ void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo
 	FJsonSerializer::Serialize(ToolCallsJsonArray, ToolCallsWriter);
 
 	// Add assistant message to history
-	FAgentMessage AssistantMsg;
-	AssistantMsg.Role = TEXT("assistant");
-	AssistantMsg.Content = AccumulatedText;
+	TArray<FString> ToolCallIds;
+	ToolCallIds.Reserve(ToolCalls.Num());
 	for (const FToolCallInfo& CallInfo : ToolCalls)
 	{
-		AssistantMsg.ToolCallIds.Add(CallInfo.Id);
+		ToolCallIds.Add(CallInfo.Id);
 	}
-	AssistantMsg.ToolCallsJson = ToolCallsJsonString;
-	ConversationHistory.Add(AssistantMsg);
+
+	FAgentMessage AssistantMsg = UnrealGPTConversationState::CreateAssistantToolCallMessage(
+		AccumulatedText,
+		ToolCallIds,
+		ToolCallsJsonString);
+	UnrealGPTConversationState::AppendMessage(ConversationHistory, AssistantMsg);
 
 	// Save assistant message to session for persistence
-	SaveAssistantMessageToSession(AccumulatedText, AssistantMsg.ToolCallIds, ToolCallsJsonString);
+	SaveAssistantMessageToSession(AccumulatedText, ToolCallIds, ToolCallsJsonString);
 
 	// Broadcast to UI
 	if (!AccumulatedText.IsEmpty())
 	{
-		OnAgentMessage.Broadcast(TEXT("assistant"), AccumulatedText, AssistantMsg.ToolCallIds);
+		UnrealGPTNotifier::BroadcastAgentMessage(this, AccumulatedText, ToolCallIds);
 	}
 	else
 	{
-		OnAgentMessage.Broadcast(TEXT("assistant"), TEXT("Executing tools..."), AssistantMsg.ToolCallIds);
+		UnrealGPTNotifier::BroadcastAgentMessage(this, TEXT("Executing tools..."), ToolCallIds);
 	}
 
 	// Helper lambda for server-side tools
@@ -2180,28 +1093,19 @@ void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo
 			{
 				const FString ToolResult = ExecuteToolCall(ToolNameCopy, ArgsCopy);
 
-				FString ToolResultForHistory = ToolResult;
-				if (ToolResultForHistory.Len() > MaxToolResultSizeLocal)
-				{
-					ToolResultForHistory = ToolResultForHistory.Left(MaxToolResultSizeLocal) +
-						TEXT("\n\n[Result truncated - original length: ") + FString::FromInt(ToolResult.Len()) +
-						TEXT(" characters.]");
-				}
+				FProcessedToolResult ProcessedToolResult =
+					UnrealGPTToolResultProcessor::ProcessResult(ToolNameCopy, ToolResult, MaxToolResultSizeLocal);
 
-				AsyncTask(ENamedThreads::GameThread, [this, ToolNameCopy, ArgsCopy, CallIdCopy, ToolResult, ToolResultForHistory]()
+				AsyncTask(ENamedThreads::GameThread, [this, ToolNameCopy, ArgsCopy, CallIdCopy, ToolResult, ProcessedToolResult]()
 				{
-					FAgentMessage ToolMsg;
-					ToolMsg.Role = TEXT("tool");
-					ToolMsg.ToolCallId = CallIdCopy;
-					ToolMsg.Content = ToolResultForHistory;
-					ConversationHistory.Add(ToolMsg);
+					FAgentMessage ToolMsg = UnrealGPTConversationState::CreateToolMessage(ProcessedToolResult.ResultForHistory, CallIdCopy);
+					UnrealGPTConversationState::AppendMessage(ConversationHistory, ToolMsg);
 
 					// Save tool message and tool call to session for persistence
-					TArray<FString> ToolImages = ExtractImagesFromToolResult(ToolResult);
-					SaveToolMessageToSession(CallIdCopy, ToolResultForHistory, ToolImages);
+					SaveToolMessageToSession(CallIdCopy, ProcessedToolResult.ResultForHistory, ProcessedToolResult.Images);
 					SaveToolCallToSession(ToolNameCopy, ArgsCopy, ToolResult);
 
-					OnToolResult.Broadcast(CallIdCopy, ToolResult);
+					UnrealGPTNotifier::BroadcastToolResult(this, CallIdCopy, ToolResult);
 					SendMessage(TEXT(""), TArray<FString>());
 				});
 			});
@@ -2210,47 +1114,18 @@ void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo
 
 		// Synchronous execution
 		FString ToolResult = ExecuteToolCall(CallInfo.Name, CallInfo.Arguments);
-		FString ToolResultForHistory = ToolResult;
+		FProcessedToolResult ProcessedToolResult =
+			UnrealGPTToolResultProcessor::ProcessResult(CallInfo.Name, ToolResult, MaxToolResultSize);
+		ScreenshotImages.Append(ProcessedToolResult.Images);
 
-		// Handle screenshot image extraction
-		if (bIsScreenshot && !ToolResult.IsEmpty())
-		{
-			const FString ImageSeparator = TEXT("\n__IMAGE_BASE64__\n");
-			int32 SeparatorIndex = ToolResult.Find(ImageSeparator);
-			if (SeparatorIndex != INDEX_NONE)
-			{
-				FString MetadataJson = ToolResult.Left(SeparatorIndex);
-				FString ImageBase64 = ToolResult.Mid(SeparatorIndex + ImageSeparator.Len());
-				if (!ImageBase64.IsEmpty())
-				{
-					ScreenshotImages.Add(ImageBase64);
-				}
-				ToolResultForHistory = MetadataJson;
-			}
-			else
-			{
-				ScreenshotImages.Add(ToolResult);
-			}
-		}
-		else if (ToolResultForHistory.Len() > MaxToolResultSize)
-		{
-			ToolResultForHistory = ToolResultForHistory.Left(MaxToolResultSize) +
-				TEXT("\n\n[Result truncated - original length: ") + FString::FromInt(ToolResult.Len()) +
-				TEXT(" characters.]");
-		}
-
-		FAgentMessage ToolMsg;
-		ToolMsg.Role = TEXT("tool");
-		ToolMsg.ToolCallId = CallInfo.Id;
-		ToolMsg.Content = ToolResultForHistory;
-		ConversationHistory.Add(ToolMsg);
+		FAgentMessage ToolMsg = UnrealGPTConversationState::CreateToolMessage(ProcessedToolResult.ResultForHistory, CallInfo.Id);
+		UnrealGPTConversationState::AppendMessage(ConversationHistory, ToolMsg);
 
 		// Save tool message and tool call to session for persistence
-		TArray<FString> ToolImages = ExtractImagesFromToolResult(ToolResult);
-		SaveToolMessageToSession(CallInfo.Id, ToolResultForHistory, ToolImages);
+		SaveToolMessageToSession(CallInfo.Id, ProcessedToolResult.ResultForHistory, ProcessedToolResult.Images);
 		SaveToolCallToSession(CallInfo.Name, CallInfo.Arguments, ToolResult);
 
-		OnToolResult.Broadcast(CallInfo.Id, ToolResult);
+		UnrealGPTNotifier::BroadcastToolResult(this, CallInfo.Id, ToolResult);
 	}
 
 	if (!bHasClientSideTools)
@@ -2272,11 +1147,10 @@ void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo
 	{
 		UE_LOG(LogTemp, Error, TEXT("UnrealGPT: Reached max tool call iterations (%d)."), MaxIterations);
 
-		FAgentMessage LimitEntry;
-		LimitEntry.Role = TEXT("assistant");
-		LimitEntry.Content = FString::Printf(TEXT("[Tool call limit reached after %d iterations.]"), MaxIterations);
-		ConversationHistory.Add(LimitEntry);
-		OnAgentMessage.Broadcast(TEXT("assistant"), LimitEntry.Content, TArray<FString>());
+		FAgentMessage LimitEntry = UnrealGPTConversationState::CreateAssistantMessage(
+			FString::Printf(TEXT("[Tool call limit reached after %d iterations.]"), MaxIterations));
+		UnrealGPTConversationState::AppendMessage(ConversationHistory, LimitEntry);
+		UnrealGPTNotifier::BroadcastAgentMessage(this, LimitEntry.Content, TArray<FString>());
 
 		ToolCallIterationCount = 0;
 		bRequestInProgress = false;
@@ -2289,177 +1163,15 @@ void UUnrealGPTAgentClient::ProcessExtractedToolCalls(const TArray<FToolCallInfo
 
 FString UUnrealGPTAgentClient::ExecuteToolCall(const FString& ToolName, const FString& ArgumentsJson)
 {
-	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: ExecuteToolCall ENTRY - Tool: %s, Args length: %d"), *ToolName, ArgumentsJson.Len());
-
-	FString Result;
-
-	const bool bIsPythonExecute = (ToolName == TEXT("python_execute"));
-	const bool bIsSceneQuery = (ToolName == TEXT("scene_query"));
-
-	if (bIsPythonExecute)
-	{
-		TSharedPtr<FJsonObject> ArgsObj;
-		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgumentsJson);
-		if (FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid())
+	return UnrealGPTToolDispatcher::ExecuteToolCall(
+		ToolName,
+		ArgumentsJson,
+		bLastToolWasPythonExecute,
+		bLastSceneQueryFoundResults,
+		[this](const FString& ToolNameInner, const FString& ArgumentsJsonInner)
 		{
-			FString Code;
-			if (ArgsObj->TryGetStringField(TEXT("code"), Code))
-			{
-				Result = UUnrealGPTToolExecutor::ExecutePythonCode(Code);
-			}
-		}
-	}
-	else if (ToolName == TEXT("viewport_screenshot"))
-	{
-		FString MetadataJson;
-		FString ImageBase64 = UUnrealGPTToolExecutor::GetViewportScreenshot(ArgumentsJson, MetadataJson);
-
-		// The image will be sent as multimodal input separately.
-		// Return the metadata JSON as the tool result so the model has context.
-		// The image base64 is stored separately for multimodal handling.
-		if (!ImageBase64.IsEmpty())
-		{
-			// Store the base64 image for later multimodal use (handled in caller)
-			// Return metadata + a marker that indicates the image was captured
-			Result = MetadataJson;
-			// Append the base64 image after a separator so caller can extract it
-			Result += TEXT("\n__IMAGE_BASE64__\n") + ImageBase64;
-		}
-		else
-		{
-			Result = MetadataJson; // Will contain error info
-		}
-	}
-	else if (ToolName == TEXT("scene_query"))
-	{
-		// Pass the raw JSON arguments through to the scene query helper.
-		// The JSON can specify filters like class_contains, label_contains,
-		// name_contains, component_class_contains, and max_results.
-		Result = UUnrealGPTSceneContext::QueryScene(ArgumentsJson);
-
-		// Check if scene_query returned results (non-empty JSON array).
-		// If it did, mark that we found results so we can block subsequent python_execute calls.
-		// scene_query returns a JSON array string, so check if it's not just "[]"
-		bLastSceneQueryFoundResults = !Result.IsEmpty() && Result != TEXT("[]") && Result.StartsWith(TEXT("["));
-		if (bLastSceneQueryFoundResults)
-		{
-			// Try to parse and verify it's actually a non-empty array
-			TSharedPtr<FJsonValue> JsonValue;
-			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Result);
-			if (FJsonSerializer::Deserialize(Reader, JsonValue) && JsonValue.IsValid())
-			{
-				const TArray<TSharedPtr<FJsonValue>>* JsonArray = nullptr;
-				if (JsonValue->Type == EJson::Array && JsonValue->TryGetArray(JsonArray))
-				{
-					bLastSceneQueryFoundResults = (JsonArray->Num() > 0);
-					if (bLastSceneQueryFoundResults)
-					{
-						UE_LOG(LogTemp, Log, TEXT("UnrealGPT: scene_query found %d results - will block subsequent python_execute"), JsonArray->Num());
-					}
-				}
-				else
-				{
-					bLastSceneQueryFoundResults = false;
-				}
-			}
-			else
-			{
-				bLastSceneQueryFoundResults = false;
-			}
-		}
-	}
-	else if (ToolName == TEXT("reflection_query"))
-	{
-		TSharedPtr<FJsonObject> ArgsObj;
-		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgumentsJson);
-		if (!(FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid()))
-		{
-			return TEXT("{\"status\":\"error\",\"message\":\"Failed to parse reflection_query arguments\"}");
-		}
-
-		FString ClassName;
-		if (!ArgsObj->TryGetStringField(TEXT("class_name"), ClassName) || ClassName.IsEmpty())
-		{
-			return TEXT("{\"status\":\"error\",\"message\":\"Missing required field: class_name\"}");
-		}
-
-		// Try to resolve the class by short name first, then by treating the
-		// input as a fully-qualified object path.
-		UClass* TargetClass = FindObject<UClass>(nullptr, *ClassName);
-		if (!TargetClass)
-		{
-			TargetClass = LoadObject<UClass>(nullptr, *ClassName);
-		}
-
-		Result = BuildReflectionSchemaJson(TargetClass);
-	}
-	else if (ToolName == TEXT("replicate_generate"))
-	{
-		// Delegate to dedicated Replicate client (extracted for code clarity)
-		Result = UUnrealGPTReplicateClient::Generate(ArgumentsJson);
-	}
-	else if (ToolName == TEXT("file_search") || ToolName == TEXT("web_search"))
-	{
-		// These are server-side tools executed by the model/platform.
-		// We just acknowledge them to avoid "Unknown tool" errors and allow the loop to continue.
-		// The actual results are typically incorporated into the model's context or subsequent messages.
-		Result = FString::Printf(TEXT("Tool '%s' executed successfully by server."), *ToolName);
-	}
-	// ==================== ATOMIC EDITOR TOOLS (delegated to ToolExecutor) ====================
-	else if (ToolName == TEXT("get_actor"))
-	{
-		Result = UUnrealGPTToolExecutor::ExecuteGetActor(ArgumentsJson);
-	}
-	else if (ToolName == TEXT("set_actor_transform"))
-	{
-		Result = UUnrealGPTToolExecutor::ExecuteSetActorTransform(ArgumentsJson);
-	}
-	else if (ToolName == TEXT("select_actors"))
-	{
-		Result = UUnrealGPTToolExecutor::ExecuteSelectActors(ArgumentsJson);
-	}
-	else if (ToolName == TEXT("duplicate_actor"))
-	{
-		Result = UUnrealGPTToolExecutor::ExecuteDuplicateActor(ArgumentsJson);
-	}
-	else if (ToolName == TEXT("snap_actor_to_ground"))
-	{
-		Result = UUnrealGPTToolExecutor::ExecuteSnapActorToGround(ArgumentsJson);
-	}
-	else if (ToolName == TEXT("set_actors_rotation"))
-	{
-		Result = UUnrealGPTToolExecutor::ExecuteSetActorsRotation(ArgumentsJson);
-	}
-	else
-	{
-		Result = FString::Printf(TEXT("Unknown tool: %s"), *ToolName);
-	}
-
-	// Track last tool type so we can avoid repeated python_execute runs.
-	bLastToolWasPythonExecute = bIsPythonExecute;
-
-	// Reset scene_query results flag if we're running a different tool (not scene_query)
-	if (!bIsSceneQuery)
-	{
-		bLastSceneQueryFoundResults = false;
-	}
-
-	// Ensure OnToolCall delegate (which can touch Slate/UI) is always broadcast on the game thread.
-	if (IsInGameThread())
-	{
-		OnToolCall.Broadcast(ToolName, ArgumentsJson);
-	}
-	else
-	{
-		const FString ToolNameCopy = ToolName;
-		const FString ArgsCopy = ArgumentsJson;
-		AsyncTask(ENamedThreads::GameThread, [this, ToolNameCopy, ArgsCopy]()
-		{
-			OnToolCall.Broadcast(ToolNameCopy, ArgsCopy);
+			UnrealGPTNotifier::BroadcastToolCall(this, ToolNameInner, ArgumentsJsonInner);
 		});
-	}
-
-	return Result;
 }
 
 TSharedRef<IHttpRequest> UUnrealGPTAgentClient::CreateHttpRequest()
@@ -2813,7 +1525,7 @@ bool UUnrealGPTAgentClient::LoadConversation(const FString& SessionId)
 		AgentMsg.ToolCallIds = Msg.ToolCallIds;
 		AgentMsg.ToolCallId = Msg.ToolCallId;
 		AgentMsg.ToolCallsJson = Msg.ToolCallsJson;
-		ConversationHistory.Add(AgentMsg);
+		UnrealGPTConversationState::AppendMessage(ConversationHistory, AgentMsg);
 	}
 
 	// Set up session manager to track this session
@@ -2838,98 +1550,21 @@ TArray<FSessionInfo> UUnrealGPTAgentClient::GetSessionList() const
 
 void UUnrealGPTAgentClient::SaveUserMessageToSession(const FString& UserMessage, const TArray<FString>& Images)
 {
-	if (!SessionManager || !SessionManager->IsAutoSaveActive())
-	{
-		return;
-	}
-
-	FPersistedMessage Msg;
-	Msg.Role = TEXT("user");
-	Msg.Content = UserMessage;
-	Msg.ImageBase64 = Images;
-	Msg.Timestamp = FDateTime::Now();
-
-	SessionManager->AppendMessage(Msg);
+	UnrealGPTSessionWriter::SaveUserMessage(SessionManager, UserMessage, Images);
 }
 
 void UUnrealGPTAgentClient::SaveAssistantMessageToSession(const FString& Content, const TArray<FString>& ToolCallIds, const FString& ToolCallsJson)
 {
-	if (!SessionManager || !SessionManager->IsAutoSaveActive())
-	{
-		return;
-	}
-
-	FPersistedMessage Msg;
-	Msg.Role = TEXT("assistant");
-	Msg.Content = Content;
-	Msg.ToolCallIds = ToolCallIds;
-	Msg.ToolCallsJson = ToolCallsJson;
-	Msg.Timestamp = FDateTime::Now();
-
-	SessionManager->AppendMessage(Msg);
-
-	// Trigger save after assistant response
-	SessionManager->SaveCurrentSession();
+	UnrealGPTSessionWriter::SaveAssistantMessageAndFlush(SessionManager, Content, ToolCallIds, ToolCallsJson);
 }
 
 void UUnrealGPTAgentClient::SaveToolMessageToSession(const FString& ToolCallId, const FString& Result, const TArray<FString>& Images)
 {
-	if (!SessionManager || !SessionManager->IsAutoSaveActive())
-	{
-		return;
-	}
-
-	FPersistedMessage Msg;
-	Msg.Role = TEXT("tool");
-	Msg.ToolCallId = ToolCallId;
-	Msg.Content = Result;
-	Msg.ImageBase64 = Images;
-	Msg.Timestamp = FDateTime::Now();
-
-	SessionManager->AppendMessage(Msg);
+	UnrealGPTSessionWriter::SaveToolMessage(SessionManager, ToolCallId, Result, Images);
 }
 
 void UUnrealGPTAgentClient::SaveToolCallToSession(const FString& ToolName, const FString& Arguments, const FString& Result)
 {
-	if (!SessionManager || !SessionManager->IsAutoSaveActive())
-	{
-		return;
-	}
-
-	FPersistedToolCall ToolCall;
-	ToolCall.ToolName = ToolName;
-	ToolCall.Arguments = Arguments;
-	ToolCall.Result = Result;
-	ToolCall.Timestamp = FDateTime::Now();
-
-	SessionManager->AppendToolCall(ToolCall);
-}
-
-TArray<FString> UUnrealGPTAgentClient::ExtractImagesFromToolResult(const FString& ToolResult) const
-{
-	TArray<FString> Images;
-
-	// Check for the image separator pattern used by viewport_screenshot
-	const FString ImageSeparator = TEXT("\n__IMAGE_BASE64__\n");
-	int32 SeparatorIndex = ToolResult.Find(ImageSeparator);
-
-	if (SeparatorIndex != INDEX_NONE)
-	{
-		FString ImageBase64 = ToolResult.Mid(SeparatorIndex + ImageSeparator.Len());
-		if (!ImageBase64.IsEmpty())
-		{
-			Images.Add(ImageBase64);
-		}
-	}
-	else
-	{
-		// Check if the entire result is a base64 image (PNG or JPEG header)
-		if (ToolResult.StartsWith(TEXT("iVBORw0KGgo")) || ToolResult.StartsWith(TEXT("/9j/")))
-		{
-			Images.Add(ToolResult);
-		}
-	}
-
-	return Images;
+	UnrealGPTSessionWriter::SaveToolCall(SessionManager, ToolName, Arguments, Result);
 }
 

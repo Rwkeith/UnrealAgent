@@ -47,7 +47,6 @@ public:
 		TArray<FUnrealGPTSseEvent>& OutEvents,
 		FString& OutError);
 
-private:
 	/** Parse a full SSE stream string into discrete events. */
 	static void ParseSseStream(
 		const FString& Stream,
