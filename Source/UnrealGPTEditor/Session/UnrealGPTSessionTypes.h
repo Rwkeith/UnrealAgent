@@ -166,7 +166,7 @@ struct FSessionData
 	FString Title;                  // Auto-generated from first user message
 	FDateTime CreatedAt;
 	FDateTime LastModifiedAt;
-	FString PreviousResponseId;     // For Responses API state
+FString PreviousResponseId;     // For response state
 	TArray<FPersistedMessage> Messages;
 	TArray<FPersistedToolCall> ToolCalls;
 

@@ -57,3 +57,21 @@ void UnrealGPTTelemetry::LogApiConversation(const FString& SessionId, const FStr
 
 	UE_LOG(LogTemp, Verbose, TEXT("UnrealGPT: Logged %s to conversation history"), *Direction);
 }
+
+void UnrealGPTTelemetry::LogRequestBodySummary(const FString& RequestBody, int32 MaxLogLength)
+{
+	if (MaxLogLength <= 0)
+	{
+		return;
+	}
+
+	if (RequestBody.Len() <= MaxLogLength)
+	{
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Request body: %s"), *RequestBody);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Request body (truncated): %s..."), *RequestBody.Left(MaxLogLength));
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Request body length: %d characters"), RequestBody.Len());
+	}
+}

@@ -8,6 +8,8 @@ class UUnrealGPTAgentClient;
 class UnrealGPTHttpClient
 {
 public:
+	static TSharedRef<IHttpRequest> CreateRequest();
+
 	static TSharedRef<IHttpRequest> BuildJsonPost(
 		TSharedRef<IHttpRequest> Request,
 		const FString& Url,

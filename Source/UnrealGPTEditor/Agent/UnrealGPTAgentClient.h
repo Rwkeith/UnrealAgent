@@ -3,9 +3,7 @@
 #include "CoreMinimal.h"
 #include "UObject/NoExportTypes.h"
 #include "Http.h"
-#include "Dom/JsonObject.h"
 #include "UnrealGPTSessionTypes.h"
-#include "UnrealGPTToolCallTypes.h"
 #include "UnrealGPTAgentClient.generated.h"
 
 // Forward declarations
@@ -58,6 +56,10 @@ class UNREALGPTEDITOR_API UUnrealGPTAgentClient : public UObject
 	GENERATED_BODY()
 
 	friend class UnrealGPTHttpClient;
+	friend class UnrealGPTResponseHandler;
+	friend class UnrealGPTResponseProcessor;
+	friend class UnrealGPTRequestSender;
+	friend class UnrealGPTToolCallProcessor;
 
 public:
 	UUnrealGPTAgentClient();
@@ -111,44 +113,11 @@ public:
 	FOnToolResult OnToolResult;
 
 private:
-	/** Build tool definitions array */
-	TArray<TSharedPtr<FJsonObject>> BuildToolDefinitions();
-
 	/** Handle HTTP response */
 	void OnResponseReceived(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
 
-	/** Process streaming response */
-	void ProcessStreamingResponse(const FString& ResponseContent);
-
-	/** Process standard JSON response from Responses API (non-streaming) */
-	void ProcessResponsesApiResponse(const FString& ResponseContent);
-
-	/** Process extracted tool calls: execute them and continue conversation */
-	void ProcessExtractedToolCalls(const TArray<FToolCallInfo>& ToolCalls, const FString& AccumulatedText);
-
-	/** Execute a tool call (delegates to UUnrealGPTToolExecutor) */
-	FString ExecuteToolCall(const FString& ToolName, const FString& ArgumentsJson);
-
-	/** Create HTTP request with proper headers */
-	TSharedRef<IHttpRequest> CreateHttpRequest();
-
-	/** Get the effective API URL, applying base URL override if set */
-	FString GetEffectiveApiUrl() const;
-
-	/** Check if we're using the Responses API endpoint */
-	bool IsUsingResponsesApi() const;
-
-	/**
-	 * Determine appropriate reasoning effort level based on message complexity.
-	 * Returns "low", "medium", or "high".
-	 * - low: Simple tool calls, single-step operations
-	 * - medium: Multi-step tasks, scene building, some ambiguity
-	 * - high: Complex planning, reference image interpretation, architectural decisions
-	 */
-	FString DetermineReasoningEffort(const FString& UserMessage, const TArray<FString>& ImagePaths) const;
-
-	/** Detect if task completion can be inferred from recent tool results */
-	bool DetectTaskCompletion(const TArray<FString>& ToolNames, const TArray<FString>& ToolResults) const;
+	/** Forward response payload handling to the protocol layer */
+	void HandleResponsePayload(const FString& ResponseContent);
 
 	/** Current HTTP request */
 	TSharedPtr<IHttpRequest> CurrentRequest;
@@ -156,7 +125,7 @@ private:
 	/** Conversation history */
 	TArray<FAgentMessage> ConversationHistory;
 
-	/** Previous response ID for Responses API state management */
+	/** Previous response ID for response state management */
 	FString PreviousResponseId;
 
 	/** Tool call iteration counter to prevent infinite loops */
@@ -226,9 +195,6 @@ private:
 
 	/** Images attached to the current message being sent */
 	TArray<FString> CurrentMessageImages;
-
-	/** Helper to save user message to session */
-	void SaveUserMessageToSession(const FString& UserMessage, const TArray<FString>& Images);
 
 	/** Helper to save assistant message to session */
 	void SaveAssistantMessageToSession(const FString& Content, const TArray<FString>& ToolCallIds, const FString& ToolCallsJson);

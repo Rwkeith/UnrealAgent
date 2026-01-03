@@ -297,27 +297,16 @@ TSharedPtr<FJsonObject> UnrealGPTToolSchemas::BuildParametersJson(const FToolSch
 	return ParamsObj;
 }
 
-TSharedPtr<FJsonObject> UnrealGPTToolSchemas::BuildToolJson(const FToolSchema& Schema, bool bUseResponsesApi)
+TSharedPtr<FJsonObject> UnrealGPTToolSchemas::BuildToolJson(const FToolSchema& Schema)
 {
 	TSharedPtr<FJsonObject> Tool = MakeShareable(new FJsonObject);
 	Tool->SetStringField(TEXT("type"), TEXT("function"));
 
 	TSharedPtr<FJsonObject> ParamsJson = BuildParametersJson(Schema);
 
-	if (bUseResponsesApi)
-	{
-		Tool->SetStringField(TEXT("name"), Schema.Name);
-		Tool->SetStringField(TEXT("description"), Schema.Description);
-		Tool->SetObjectField(TEXT("parameters"), ParamsJson);
-	}
-	else
-	{
-		TSharedPtr<FJsonObject> FunctionObj = MakeShareable(new FJsonObject);
-		FunctionObj->SetStringField(TEXT("name"), Schema.Name);
-		FunctionObj->SetStringField(TEXT("description"), Schema.Description);
-		FunctionObj->SetObjectField(TEXT("parameters"), ParamsJson);
-		Tool->SetObjectField(TEXT("function"), FunctionObj);
-	}
+	Tool->SetStringField(TEXT("name"), Schema.Name);
+	Tool->SetStringField(TEXT("description"), Schema.Description);
+	Tool->SetObjectField(TEXT("parameters"), ParamsJson);
 
 	return Tool;
 }

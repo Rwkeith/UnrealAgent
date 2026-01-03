@@ -104,7 +104,6 @@ namespace UnrealGPTToolSchemas
 	 * Build a complete tool JSON object from a schema.
 	 *
 	 * @param Schema - The tool schema
-	 * @param bUseResponsesApi - Whether to use Responses API format (vs Chat Completions)
 	 */
-	TSharedPtr<FJsonObject> BuildToolJson(const FToolSchema& Schema, bool bUseResponsesApi);
+	TSharedPtr<FJsonObject> BuildToolJson(const FToolSchema& Schema);
 }

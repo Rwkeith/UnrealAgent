@@ -1,7 +1,7 @@
 #include "UnrealGPTConversationState.h"
 #include "UnrealGPTAgentClient.h"
 
-FConversationContinuation UnrealGPTConversationState::BuildResponsesApiContinuation(const TArray<FAgentMessage>& ConversationHistory, bool bIsNewUserMessage)
+FConversationContinuation UnrealGPTConversationState::BuildContinuation(const TArray<FAgentMessage>& ConversationHistory, bool bIsNewUserMessage)
 {
 	FConversationContinuation Result;
 
@@ -23,7 +23,7 @@ FConversationContinuation UnrealGPTConversationState::BuildResponsesApiContinuat
 			UE_LOG(LogTemp, Warning, TEXT("UnrealGPT: History is empty after adding user message, this should not happen"));
 		}
 
-		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Responses API - new user message, starting from index %d (history size: %d)"), Result.StartIndex, ConversationHistory.Num());
+		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: New user message, starting from index %d (history size: %d)"), Result.StartIndex, ConversationHistory.Num());
 		return Result;
 	}
 
@@ -62,7 +62,7 @@ FConversationContinuation UnrealGPTConversationState::BuildResponsesApiContinuat
 		UE_LOG(LogTemp, Log, TEXT("UnrealGPT: No user message found, starting from end of history (index %d)"), Result.StartIndex);
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Responses API - tool continuation, starting from index %d, will include %d tool results"), Result.StartIndex, Result.ToolResultsToInclude.Num());
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Tool continuation, starting from index %d, will include %d tool results"), Result.StartIndex, Result.ToolResultsToInclude.Num());
 
 	LogToolCallCoverage(ConversationHistory, Result.ToolResultsToInclude);
 

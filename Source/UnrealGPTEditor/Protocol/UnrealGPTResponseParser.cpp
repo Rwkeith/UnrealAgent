@@ -2,7 +2,6 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
-#include "UnrealGPTSseClient.h"
 #include "UnrealGPTToolCallTypes.h"
 
 void UnrealGPTResponseParser::ExtractFromResponseOutput(const TArray<TSharedPtr<FJsonValue>>& OutputArray, FResponseParseResult& OutResult)
@@ -294,79 +293,4 @@ void UnrealGPTResponseParser::ExtractFromResponseOutput(const TArray<TSharedPtr<
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Extracted %d tool calls, %d chars of text"), OutResult.ToolCalls.Num(), OutResult.AccumulatedText.Len());
-}
-
-void UnrealGPTResponseParser::ParseChatCompletionsSse(const FString& ResponseContent, FStreamingParseResult& OutResult)
-{
-	OutResult = FStreamingParseResult();
-
-	TArray<FUnrealGPTSseEvent> Events;
-	FUnrealGPTSseClient::ParseSseStream(ResponseContent, Events);
-
-	for (const FUnrealGPTSseEvent& Event : Events)
-	{
-		const FString& Data = Event.Data;
-		if (Data == TEXT("[DONE]"))
-		{
-			break;
-		}
-
-		TSharedPtr<FJsonObject> JsonObject;
-		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Data);
-		if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
-		{
-			continue;
-		}
-
-		const TArray<TSharedPtr<FJsonValue>>* ChoicesArray = nullptr;
-		if (!JsonObject->TryGetArrayField(TEXT("choices"), ChoicesArray) || !ChoicesArray || ChoicesArray->Num() == 0)
-		{
-			continue;
-		}
-
-		const TSharedPtr<FJsonObject>* ChoiceObj = nullptr;
-		if (!(*ChoicesArray)[0]->TryGetObject(ChoiceObj) || !ChoiceObj || !(*ChoiceObj).IsValid())
-		{
-			continue;
-		}
-
-		const TSharedPtr<FJsonObject>* DeltaObj = nullptr;
-		if ((*ChoiceObj)->TryGetObjectField(TEXT("delta"), DeltaObj) && DeltaObj && (*DeltaObj).IsValid())
-		{
-			FString ContentDelta;
-			if ((*DeltaObj)->TryGetStringField(TEXT("content"), ContentDelta))
-			{
-				OutResult.AccumulatedContent += ContentDelta;
-			}
-
-			const TArray<TSharedPtr<FJsonValue>>* ToolCallsArray = nullptr;
-			if ((*DeltaObj)->TryGetArrayField(TEXT("tool_calls"), ToolCallsArray))
-			{
-				for (const TSharedPtr<FJsonValue>& ToolCallValue : *ToolCallsArray)
-				{
-					const TSharedPtr<FJsonObject>* ToolCallObj = nullptr;
-					if (!ToolCallValue->TryGetObject(ToolCallObj) || !ToolCallObj || !(*ToolCallObj).IsValid())
-					{
-						continue;
-					}
-
-					(*ToolCallObj)->TryGetStringField(TEXT("id"), OutResult.ToolCallId);
-
-					const TSharedPtr<FJsonObject>* FunctionObj = nullptr;
-					if ((*ToolCallObj)->TryGetObjectField(TEXT("function"), FunctionObj) && FunctionObj && (*FunctionObj).IsValid())
-					{
-						(*FunctionObj)->TryGetStringField(TEXT("name"), OutResult.ToolName);
-
-						FString ArgumentsDelta;
-						if ((*FunctionObj)->TryGetStringField(TEXT("arguments"), ArgumentsDelta))
-						{
-							OutResult.ToolArguments += ArgumentsDelta;
-						}
-					}
-				}
-			}
-		}
-
-		(*ChoiceObj)->TryGetStringField(TEXT("finish_reason"), OutResult.FinishReason);
-	}
 }

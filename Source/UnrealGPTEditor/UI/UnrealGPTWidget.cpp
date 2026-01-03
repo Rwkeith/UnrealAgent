@@ -1394,7 +1394,7 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 		ToolDisplayName = TEXT("UE API Docs Search"); // Clearer name indicating it searches Unreal Engine documentation
 
 		// Parse the query from arguments
-		// OpenAI file_search_call uses "queries" (array) in Responses API
+		// OpenAI file_search_call uses "queries" (array) in its arguments.
 		FString Query;
 		if (!Arguments.StartsWith(TEXT("{")))
 		{
@@ -1406,7 +1406,7 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolSpecificWidget(const FString& To
 			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Arguments);
 			if (FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid())
 			{
-				// Try "queries" array first (OpenAI Responses API format)
+				// Try "queries" array first.
 				const TArray<TSharedPtr<FJsonValue>>* QueriesArray = nullptr;
 				if (ArgsObj->TryGetArrayField(TEXT("queries"), QueriesArray) && QueriesArray && QueriesArray->Num() > 0)
 				{

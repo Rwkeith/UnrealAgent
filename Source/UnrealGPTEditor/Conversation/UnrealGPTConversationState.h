@@ -13,7 +13,7 @@ struct FConversationContinuation
 class UnrealGPTConversationState
 {
 public:
-	static FConversationContinuation BuildResponsesApiContinuation(const TArray<FAgentMessage>& ConversationHistory, bool bIsNewUserMessage);
+	static FConversationContinuation BuildContinuation(const TArray<FAgentMessage>& ConversationHistory, bool bIsNewUserMessage);
 	static void LogToolCallCoverage(const TArray<FAgentMessage>& ConversationHistory, const TArray<FAgentMessage>& ToolResultsToInclude);
 
 	static FAgentMessage CreateUserMessage(const FString& Content);

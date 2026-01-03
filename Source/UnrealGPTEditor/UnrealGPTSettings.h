@@ -17,7 +17,7 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "API", meta = (DisplayName = "Base URL Override"))
 	FString BaseUrlOverride;
 
-	/** OpenAI-compatible API endpoint URL (use /v1/responses for Responses API or /v1/chat/completions for legacy API) */
+	/** OpenAI-compatible API endpoint URL (use /v1/responses) */
 	UPROPERTY(config, EditAnywhere, Category = "API", meta = (DisplayName = "API Endpoint"))
 	FString ApiEndpoint = TEXT("https://api.openai.com/v1/responses");
 

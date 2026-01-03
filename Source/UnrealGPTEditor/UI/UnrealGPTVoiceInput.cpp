@@ -145,7 +145,6 @@ void UUnrealGPTVoiceInput::StopRecordingAndTranscribe()
 
 	// First, normalize the path portion for audio transcriptions
 	WhisperEndpoint.ReplaceInline(TEXT("/v1/responses"), TEXT("/v1/audio/transcriptions"));
-	WhisperEndpoint.ReplaceInline(TEXT("/v1/chat/completions"), TEXT("/v1/audio/transcriptions"));
 
 	// If the configured endpoint is not a full URL, build it from the base URL
 	if (!WhisperEndpoint.StartsWith(TEXT("http")))
