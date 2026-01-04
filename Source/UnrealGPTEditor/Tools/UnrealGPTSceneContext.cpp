@@ -827,6 +827,7 @@ FString UUnrealGPTSceneContext::QueryScene(const FString& ArgumentsJson)
 
 	// Build final result object
 	TSharedPtr<FJsonObject> ResultObj = MakeShareable(new FJsonObject);
+	ResultObj->SetStringField(TEXT("status"), TEXT("ok"));  // Add status for agent executor compatibility
 	ResultObj->SetObjectField(TEXT("summary"), SummaryObj);
 	ResultObj->SetArrayField(TEXT("actors"), ResultsArray);
 

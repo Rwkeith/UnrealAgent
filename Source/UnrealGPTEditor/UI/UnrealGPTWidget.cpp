@@ -6,6 +6,7 @@
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Text/SRichTextBlock.h"
+#include "Widgets/Notifications/SProgressBar.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
@@ -236,6 +237,17 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 	VoiceInput->OnRecordingStarted.AddDynamic(DelegateHandler, &UUnrealGPTWidgetDelegateHandler::OnRecordingStartedReceived);
 	VoiceInput->OnRecordingStopped.AddDynamic(DelegateHandler, &UUnrealGPTWidgetDelegateHandler::OnRecordingStoppedReceived);
 
+	// Create true agent controller and bind delegates
+	AgentController = MakeUnique<FAgentController>();
+	AgentController->Initialize(AgentClient);
+	DelegateHandler->BindToAgentController(AgentController.Get());
+
+	// Register ticker to drive the agent state machine
+	AgentTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateSP(this, &SUnrealGPTWidget::OnAgentTick),
+		0.1f  // Tick every 100ms
+	);
+
 	ChildSlot
 	[
 		SNew(SBorder)
@@ -409,7 +421,45 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 					[
 						SNullWidget::NullWidget
 					]
-					
+
+					// Agent Mode Toggle
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.Padding(0.0f, 0.0f, 8.0f, 0.0f)
+					[
+						SNew(SBox)
+						.MinDesiredWidth(130.0f)
+						[
+							SAssignNew(AgentModeToggleButton, SButton)
+							.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+							.ForegroundColor(FSlateColor::UseForeground())
+							.ContentPadding(FMargin(10.0f, 6.0f))
+							.OnClicked(this, &SUnrealGPTWidget::OnAgentModeToggleClicked)
+							.ToolTipText(this, &SUnrealGPTWidget::GetAgentModeTooltip)
+							[
+								SNew(SHorizontalBox)
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								.VAlign(VAlign_Center)
+								.Padding(0.0f, 0.0f, 6.0f, 0.0f)
+								[
+									SNew(STextBlock)
+									.Font(FAppStyle::Get().GetFontStyle("FontAwesome.11"))
+									.Text(FText::FromString(FString(TEXT("\xf188")))) // Bug/robot icon
+									.ColorAndOpacity(this, &SUnrealGPTWidget::GetAgentModeButtonColor)
+								]
+								+ SHorizontalBox::Slot()
+								.VAlign(VAlign_Center)
+								[
+									SAssignNew(AgentModeText, STextBlock)
+									.Text(this, &SUnrealGPTWidget::GetAgentModeText)
+									.Font(FAppStyle::GetFontStyle("SmallFont"))
+									.ColorAndOpacity(this, &SUnrealGPTWidget::GetAgentModeButtonColor)
+								]
+							]
+						]
+					]
+
 					// Right section - Settings
 					+ SHorizontalBox::Slot()
 					.AutoWidth()
@@ -446,7 +496,104 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 					]
 				]
 			]
-			
+
+			// Agent Status Bar (visible when in Agent Mode and not Idle)
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			[
+				SAssignNew(AgentStatusBorder, SBorder)
+				.BorderImage(FAppStyle::GetBrush("Brushes.Header"))
+				.BorderBackgroundColor(FLinearColor(0.02f, 0.06f, 0.02f, 1.0f))
+				.Padding(FMargin(12.0f, 6.0f))
+				.Visibility(EVisibility::Collapsed)
+				[
+					SNew(SHorizontalBox)
+
+					// Status icon
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(0.0f, 0.0f, 8.0f, 0.0f)
+					[
+						SNew(STextBlock)
+						.Font(FAppStyle::Get().GetFontStyle("FontAwesome.11"))
+						.Text(FText::FromString(FString(TEXT("\xf188")))) // Robot/bug icon
+						.ColorAndOpacity(FLinearColor(0.3f, 0.9f, 0.5f))
+					]
+
+					// Status text
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(0.0f, 0.0f, 12.0f, 0.0f)
+					[
+						SAssignNew(AgentStatusText, STextBlock)
+						.Text(NSLOCTEXT("UnrealGPT", "AgentIdle", "Idle"))
+						.Font(FAppStyle::GetFontStyle("SmallFontBold"))
+						.ColorAndOpacity(FLinearColor(0.3f, 0.9f, 0.5f))
+					]
+
+					// Progress bar
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.0f)
+					.VAlign(VAlign_Center)
+					.Padding(0.0f, 0.0f, 12.0f, 0.0f)
+					[
+						SAssignNew(AgentProgressBar, SProgressBar)
+						.Percent(0.0f)
+						.FillColorAndOpacity(FLinearColor(0.3f, 0.7f, 0.4f))
+						.Visibility(EVisibility::Collapsed)
+					]
+
+					// Progress text
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(0.0f, 0.0f, 12.0f, 0.0f)
+					[
+						SAssignNew(AgentProgressText, STextBlock)
+						.Text(FText::GetEmpty())
+						.Font(FAppStyle::GetFontStyle("SmallFont"))
+						.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
+					]
+
+					// Cancel button
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					[
+						SAssignNew(AgentCancelButton, SButton)
+						.ButtonStyle(FAppStyle::Get(), "FlatButton.Danger")
+						.ForegroundColor(FSlateColor::UseForeground())
+						.ContentPadding(FMargin(8.0f, 4.0f))
+						.OnClicked(this, &SUnrealGPTWidget::OnAgentCancelClicked)
+						.ToolTipText(NSLOCTEXT("UnrealGPT", "CancelAgentTooltip", "Cancel the current agent operation"))
+						[
+							SNew(SHorizontalBox)
+							+ SHorizontalBox::Slot()
+							.AutoWidth()
+							.VAlign(VAlign_Center)
+							.Padding(0.0f, 0.0f, 4.0f, 0.0f)
+							[
+								SNew(STextBlock)
+								.Font(FAppStyle::Get().GetFontStyle("FontAwesome.10"))
+								.Text(FText::FromString(FString(TEXT("\xf00d")))) // X icon
+								.ColorAndOpacity(FLinearColor(1.0f, 0.4f, 0.4f))
+							]
+							+ SHorizontalBox::Slot()
+							.AutoWidth()
+							.VAlign(VAlign_Center)
+							[
+								SNew(STextBlock)
+								.Text(NSLOCTEXT("UnrealGPT", "CancelAgent", "Cancel"))
+								.Font(FAppStyle::GetFontStyle("SmallFont"))
+								.ColorAndOpacity(FLinearColor(1.0f, 0.5f, 0.5f))
+							]
+						]
+					]
+				]
+			]
+
 			// Screenshot preview with better styling
 			+ SVerticalBox::Slot()
 			.AutoHeight()
@@ -455,7 +602,7 @@ void SUnrealGPTWidget::Construct(const FArguments& InArgs)
 				SAssignNew(ScreenshotPreview, SImage)
 				.Visibility(EVisibility::Collapsed)
 			]
-			
+
 			// Chat history with subtle background
 			+ SVerticalBox::Slot()
 			.FillHeight(1.0f)
@@ -1647,7 +1794,7 @@ TSharedRef<SWidget> SUnrealGPTWidget::CreateToolCallWidget(const FString& ToolNa
 
 FReply SUnrealGPTWidget::OnSendClicked()
 {
-	if (!InputTextBox.IsValid() || !IsValid(AgentClient))
+	if (!InputTextBox.IsValid())
 	{
 		return FReply::Handled();
 	}
@@ -1678,21 +1825,42 @@ FReply SUnrealGPTWidget::OnSendClicked()
 	// Clear input
 	InputTextBox->SetText(FText::GetEmpty());
 
-	// Send to agent
-	AgentClient->SendMessage(Message, PendingAttachedImages);
-
-	// Show reasoning indicator while the agent is working
-	if (ReasoningStatusBorder.IsValid())
+	// Route based on current mode
+	if (bAgentModeEnabled && AgentController.IsValid())
 	{
-		ReasoningStatusBorder->SetVisibility(EVisibility::Visible);
-	}
-	if (ReasoningSummaryText.IsValid())
-	{
-		ReasoningSummaryText->SetText(NSLOCTEXT("UnrealGPT", "ReasoningPendingShort", "Thinking..."));
-	}
+		// Agent Mode: Check if agent is waiting for user input
+		if (AgentController->GetState() == EAgentState::WaitingForUser)
+		{
+			// Respond to agent's question
+			AgentController->HandleUserResponse(Message);
+		}
+		else
+		{
+			// New request - start agent loop
+			AgentController->HandleUserRequest(Message);
+		}
 
-	// Clear any pending images after sending
-	PendingAttachedImages.Empty();
+		// Clear pending images (agent mode doesn't support images yet)
+		PendingAttachedImages.Empty();
+	}
+	else if (IsValid(AgentClient))
+	{
+		// LLM Chat Mode: Send directly to LLM
+		AgentClient->SendMessage(Message, PendingAttachedImages);
+
+		// Show reasoning indicator while the agent is working
+		if (ReasoningStatusBorder.IsValid())
+		{
+			ReasoningStatusBorder->SetVisibility(EVisibility::Visible);
+		}
+		if (ReasoningSummaryText.IsValid())
+		{
+			ReasoningSummaryText->SetText(NSLOCTEXT("UnrealGPT", "ReasoningPendingShort", "Thinking..."));
+		}
+
+		// Clear any pending images after sending
+		PendingAttachedImages.Empty();
+	}
 
 	return FReply::Handled();
 }
@@ -1910,6 +2078,27 @@ bool SUnrealGPTWidget::IsSendEnabled() const
 
 	FString Text = InputTextBox->GetText().ToString();
 	return !Text.IsEmpty() || PendingAttachedImages.Num() > 0;
+}
+
+SUnrealGPTWidget::~SUnrealGPTWidget()
+{
+	// Remove the ticker when the widget is destroyed
+	if (AgentTickerHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(AgentTickerHandle);
+		AgentTickerHandle.Reset();
+	}
+}
+
+bool SUnrealGPTWidget::OnAgentTick(float DeltaTime)
+{
+	// Drive the agent state machine when in agent mode
+	if (bAgentModeEnabled && AgentController.IsValid())
+	{
+		AgentController->Tick();
+	}
+
+	return true; // Continue ticking
 }
 
 void SUnrealGPTWidget::HandleAgentMessage(const FString& Role, const FString& Content, const TArray<FString>& ToolCalls)
@@ -2856,5 +3045,1005 @@ void SUnrealGPTWidget::DisplayImageFromBase64(const FString& ImageBase64)
 				.Image(Brush.Get())
 			]
 		];
+}
+
+// ==================== AGENT CONTROLLER HANDLERS ====================
+
+void SUnrealGPTWidget::HandleAgentStateChanged(EAgentState OldState, EAgentState NewState)
+{
+	CurrentDisplayedAgentState = NewState;
+
+	// Update status display
+	if (AgentStatusText.IsValid())
+	{
+		AgentStatusText->SetText(FText::FromString(GetAgentStateDisplayName(NewState)));
+		AgentStatusText->SetColorAndOpacity(FSlateColor(GetAgentStateColor(NewState)));
+	}
+
+	// Show/hide status border based on state
+	if (AgentStatusBorder.IsValid())
+	{
+		AgentStatusBorder->SetVisibility(
+			NewState == EAgentState::Idle ? EVisibility::Collapsed : EVisibility::Visible
+		);
+	}
+
+	// Show/hide cancel button - only visible when agent is actively working
+	if (AgentCancelButton.IsValid())
+	{
+		bool bShowCancel = (NewState != EAgentState::Idle && NewState != EAgentState::Completed);
+		AgentCancelButton->SetVisibility(bShowCancel ? EVisibility::Visible : EVisibility::Collapsed);
+	}
+
+	// Add state change to chat history for visibility
+	if (ChatHistoryBox.IsValid() && NewState != EAgentState::Idle)
+	{
+		FString StateMessage = FString::Printf(TEXT("Agent: %s"), *GetAgentStateDisplayName(NewState));
+		ChatHistoryBox->AddSlot()
+			.Padding(12.0f, 4.0f)
+			[
+				CreateAgentStateWidget(NewState, StateMessage)
+			];
+		ChatHistoryBox->ScrollToEnd();
+	}
+}
+
+void SUnrealGPTWidget::HandleAgentGoalCompleted(const FAgentGoal& Goal, const FGoalEvaluation& Evaluation)
+{
+	if (!ChatHistoryBox.IsValid())
+	{
+		return;
+	}
+
+	// Create success message
+	FString SuccessMessage = FString::Printf(
+		TEXT("Goal completed: %s\nProgress: %.0f%%"),
+		*Goal.Description,
+		Evaluation.ProgressPercent
+	);
+
+	// Add detailed criteria results if available
+	if (Evaluation.PassedCriteria.Num() > 0 || Evaluation.FailedCriteria.Num() > 0)
+	{
+		SuccessMessage += TEXT("\n\nCriteria Results:");
+		for (const FString& Criterion : Evaluation.PassedCriteria)
+		{
+			SuccessMessage += FString::Printf(TEXT("\n  [PASS] %s"), *Criterion);
+		}
+		for (const FString& Criterion : Evaluation.FailedCriteria)
+		{
+			SuccessMessage += FString::Printf(TEXT("\n  [FAIL] %s"), *Criterion);
+		}
+	}
+
+	ChatHistoryBox->AddSlot()
+		.Padding(12.0f, 6.0f)
+		[
+			SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+			.BorderBackgroundColor(FLinearColor(0.1f, 0.4f, 0.1f, 0.8f))
+			.Padding(FMargin(12.0f, 8.0f))
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(SuccessMessage))
+				.ColorAndOpacity(FLinearColor(0.3f, 1.0f, 0.3f))
+				.AutoWrapText(true)
+			]
+		];
+
+	ChatHistoryBox->ScrollToEnd();
+
+	// Hide progress UI
+	if (AgentProgressBar.IsValid())
+	{
+		AgentProgressBar->SetVisibility(EVisibility::Collapsed);
+	}
+}
+
+void SUnrealGPTWidget::HandleAgentGoalFailed(const FAgentGoal& Goal, const FString& Reason)
+{
+	if (!ChatHistoryBox.IsValid())
+	{
+		return;
+	}
+
+	FString FailureMessage = FString::Printf(
+		TEXT("Goal failed: %s\n\nReason: %s"),
+		*Goal.Description,
+		*Reason
+	);
+
+	ChatHistoryBox->AddSlot()
+		.Padding(12.0f, 6.0f)
+		[
+			SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+			.BorderBackgroundColor(FLinearColor(0.4f, 0.1f, 0.1f, 0.8f))
+			.Padding(FMargin(12.0f, 8.0f))
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(FailureMessage))
+				.ColorAndOpacity(FLinearColor(1.0f, 0.3f, 0.3f))
+				.AutoWrapText(true)
+			]
+		];
+
+	ChatHistoryBox->ScrollToEnd();
+
+	// Hide progress UI
+	if (AgentProgressBar.IsValid())
+	{
+		AgentProgressBar->SetVisibility(EVisibility::Collapsed);
+	}
+}
+
+void SUnrealGPTWidget::HandleAgentStepCompleted(const FPlanStep& Step, const FStepResult& Result)
+{
+	if (!ChatHistoryBox.IsValid())
+	{
+		return;
+	}
+
+	// Create step result widget
+	const bool bStepSuccess = Result.IsSuccess();
+	FLinearColor ResultColor = bStepSuccess ? FLinearColor(0.3f, 0.8f, 0.3f) : FLinearColor(0.8f, 0.3f, 0.3f);
+	FLinearColor ToolColor = FLinearColor(0.5f, 0.7f, 0.9f);
+	FString StatusIcon = bStepSuccess ? TEXT("[OK]") : TEXT("[FAIL]");
+
+	FString StepMessage = FString::Printf(
+		TEXT("%s Step: %s"),
+		*StatusIcon,
+		*Step.Description
+	);
+
+	if (!bStepSuccess && !Result.ToolResult.ErrorMessage.IsEmpty())
+	{
+		StepMessage += FString::Printf(TEXT("\n   Error: %s"), *Result.ToolResult.ErrorMessage);
+	}
+
+	// Build the main step widget content
+	TSharedRef<SVerticalBox> StepContent = SNew(SVerticalBox)
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		[
+			SNew(STextBlock)
+			.Text(FText::FromString(StepMessage))
+			.ColorAndOpacity(FSlateColor(ResultColor))
+			.Font(FAppStyle::GetFontStyle("SmallFont"))
+			.AutoWrapText(true)
+		];
+
+	// Add tool-specific expandable details
+	if (!Step.ToolName.IsEmpty())
+	{
+		FString ToolHeader = FString::Printf(TEXT("Tool: %s"), *Step.ToolName);
+
+		// For python_execute, create expandable code view
+		if (Step.ToolName == TEXT("python_execute"))
+		{
+			const FString* CodeArg = Step.ToolArguments.Find(TEXT("code"));
+			if (CodeArg && !CodeArg->IsEmpty())
+			{
+				FString Code = *CodeArg;
+				FString ResultOutput = Result.ToolResult.RawOutput;
+
+				// Count lines for expand/collapse decision
+				TArray<FString> CodeLines;
+				Code.ParseIntoArrayLines(CodeLines);
+				const int32 LineCount = CodeLines.Num();
+				const int32 MaxVisibleLines = 5;
+
+				// Build preview (first N lines)
+				FString CodePreview;
+				for (int32 i = 0; i < FMath::Min(MaxVisibleLines, LineCount); ++i)
+				{
+					CodePreview += CodeLines[i] + TEXT("\n");
+				}
+				CodePreview = CodePreview.TrimEnd();
+
+				// Create expand/collapse widget switcher
+				TSharedPtr<SWidgetSwitcher> CodeSwitcher = SNew(SWidgetSwitcher)
+					.WidgetIndex(0); // Start collapsed
+
+				const int32 ExtraLines = FMath::Max(0, LineCount - MaxVisibleLines);
+
+				// Build result display (truncated if too long)
+				FString ResultDisplay;
+				if (!ResultOutput.IsEmpty())
+				{
+					// Try to extract meaningful output from JSON result
+					TSharedPtr<FJsonObject> ResultObj;
+					TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ResultOutput);
+					if (FJsonSerializer::Deserialize(Reader, ResultObj) && ResultObj.IsValid())
+					{
+						FString Message;
+						if (ResultObj->TryGetStringField(TEXT("message"), Message))
+						{
+							ResultDisplay = Message;
+						}
+						else if (ResultObj->TryGetStringField(TEXT("output"), Message))
+						{
+							ResultDisplay = Message;
+						}
+						else
+						{
+							ResultDisplay = ResultOutput.Left(200);
+							if (ResultOutput.Len() > 200) ResultDisplay += TEXT("...");
+						}
+					}
+					else
+					{
+						ResultDisplay = ResultOutput.Left(200);
+						if (ResultOutput.Len() > 200) ResultDisplay += TEXT("...");
+					}
+				}
+
+				// Slot 0: Collapsed state
+				CodeSwitcher->AddSlot()
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+						.BorderBackgroundColor(FLinearColor(0.05f, 0.05f, 0.1f, 1.0f))
+						.Padding(FMargin(6.0f, 4.0f))
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(CodePreview))
+							.Font(FCoreStyle::GetDefaultFontStyle("Mono", 8))
+							.ColorAndOpacity(FLinearColor(0.8f, 0.8f, 0.8f, 1.0f))
+							.AutoWrapText(true)
+						]
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 2.0f, 0.0f, 0.0f)
+					[
+						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+						.OnClicked_Lambda([CodeSwitcher]() {
+							if (CodeSwitcher.IsValid())
+							{
+								CodeSwitcher->SetActiveWidgetIndex(1);
+							}
+							return FReply::Handled();
+						})
+						.Visibility(ExtraLines > 0 ? EVisibility::Visible : EVisibility::Collapsed)
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(FString::Printf(TEXT("▼ Show %d more lines + output"), ExtraLines)))
+							.Font(FAppStyle::GetFontStyle("TinyFont"))
+							.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+						]
+					]
+				];
+
+				// Slot 1: Expanded state (full code + result)
+				CodeSwitcher->AddSlot()
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(NSLOCTEXT("UnrealGPT", "AgentStepCode", "Code:"))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+						.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f, 1.0f))
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 2.0f, 0.0f, 0.0f)
+					[
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+						.BorderBackgroundColor(FLinearColor(0.05f, 0.05f, 0.1f, 1.0f))
+						.Padding(FMargin(6.0f, 4.0f))
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(Code))
+							.Font(FCoreStyle::GetDefaultFontStyle("Mono", 8))
+							.ColorAndOpacity(FLinearColor(0.8f, 0.9f, 0.8f, 1.0f))
+							.AutoWrapText(true)
+						]
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+					[
+						SNew(STextBlock)
+						.Text(NSLOCTEXT("UnrealGPT", "AgentStepOutput", "Output:"))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+						.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f, 1.0f))
+						.Visibility(ResultDisplay.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible)
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 2.0f, 0.0f, 0.0f)
+					[
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+						.BorderBackgroundColor(bStepSuccess ? FLinearColor(0.05f, 0.1f, 0.05f, 1.0f) : FLinearColor(0.1f, 0.05f, 0.05f, 1.0f))
+						.Padding(FMargin(6.0f, 4.0f))
+						.Visibility(ResultDisplay.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible)
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(ResultDisplay))
+							.Font(FCoreStyle::GetDefaultFontStyle("Mono", 8))
+							.ColorAndOpacity(bStepSuccess ? FLinearColor(0.7f, 0.9f, 0.7f, 1.0f) : FLinearColor(0.9f, 0.7f, 0.7f, 1.0f))
+							.AutoWrapText(true)
+						]
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+					[
+						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+						.OnClicked_Lambda([CodeSwitcher]() {
+							if (CodeSwitcher.IsValid())
+							{
+								CodeSwitcher->SetActiveWidgetIndex(0);
+							}
+							return FReply::Handled();
+						})
+						[
+							SNew(STextBlock)
+							.Text(NSLOCTEXT("UnrealGPT", "AgentStepCollapse", "▲ Collapse"))
+							.Font(FAppStyle::GetFontStyle("TinyFont"))
+							.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+						]
+					]
+				];
+
+				// Add the tool header and expandable code view
+				StepContent->AddSlot()
+					.AutoHeight()
+					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(ToolHeader))
+						.ColorAndOpacity(FSlateColor(ToolColor * 0.8f))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+					];
+
+				StepContent->AddSlot()
+					.AutoHeight()
+					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+					[
+						CodeSwitcher.ToSharedRef()
+					];
+			}
+		}
+		// For scene_query, create expandable output view
+		else if (Step.ToolName == TEXT("scene_query"))
+		{
+			TArray<FString> QueryParts;
+			for (const auto& Arg : Step.ToolArguments)
+			{
+				QueryParts.Add(FString::Printf(TEXT("%s=%s"), *Arg.Key, *Arg.Value));
+			}
+			FString QueryParams = QueryParts.Num() > 0 ? FString::Join(QueryParts, TEXT(", ")) : TEXT("all");
+			FString ResultOutput = Result.ToolResult.RawOutput;
+
+			// Parse the JSON result to get a count and summary
+			FString ResultSummary;
+			int32 ObjectCount = 0;
+			TSharedPtr<FJsonObject> ResultObj;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ResultOutput);
+			if (FJsonSerializer::Deserialize(Reader, ResultObj) && ResultObj.IsValid())
+			{
+				const TArray<TSharedPtr<FJsonValue>>* ObjectsArray = nullptr;
+				if (ResultObj->TryGetArrayField(TEXT("objects"), ObjectsArray) && ObjectsArray)
+				{
+					ObjectCount = ObjectsArray->Num();
+					ResultSummary = FString::Printf(TEXT("Found %d objects"), ObjectCount);
+				}
+				else
+				{
+					ResultSummary = TEXT("Query completed");
+				}
+			}
+			else
+			{
+				ResultSummary = TEXT("Query completed");
+			}
+
+			// Create expand/collapse widget switcher
+			TSharedPtr<SWidgetSwitcher> QuerySwitcher = SNew(SWidgetSwitcher)
+				.WidgetIndex(0); // Start collapsed
+
+			// Slot 0: Collapsed state - shows summary
+			QuerySwitcher->AddSlot()
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(FString::Printf(TEXT("Query: %s"), *QueryParams)))
+						.ColorAndOpacity(FSlateColor(ToolColor * 0.8f))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(FString::Printf(TEXT("→ %s"), *ResultSummary)))
+						.ColorAndOpacity(FSlateColor(ResultColor * 0.8f))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+					]
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 2.0f, 0.0f, 0.0f)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+					.OnClicked_Lambda([QuerySwitcher]() {
+						if (QuerySwitcher.IsValid())
+						{
+							QuerySwitcher->SetActiveWidgetIndex(1);
+						}
+						return FReply::Handled();
+					})
+					.Visibility(!ResultOutput.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed)
+					[
+						SNew(STextBlock)
+						.Text(NSLOCTEXT("UnrealGPT", "ShowFullOutput", "▼ Show full output"))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+						.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+					]
+				]
+			];
+
+			// Slot 1: Expanded state - shows full JSON output
+			QuerySwitcher->AddSlot()
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(FString::Printf(TEXT("Query: %s → %s"), *QueryParams, *ResultSummary)))
+					.ColorAndOpacity(FSlateColor(ToolColor * 0.8f))
+					.Font(FAppStyle::GetFontStyle("TinyFont"))
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				[
+					SNew(STextBlock)
+					.Text(NSLOCTEXT("UnrealGPT", "QueryResult", "Result:"))
+					.Font(FAppStyle::GetFontStyle("TinyFont"))
+					.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f, 1.0f))
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 2.0f, 0.0f, 0.0f)
+				[
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+					.BorderBackgroundColor(bStepSuccess ? FLinearColor(0.05f, 0.1f, 0.05f, 1.0f) : FLinearColor(0.1f, 0.05f, 0.05f, 1.0f))
+					.Padding(FMargin(6.0f, 4.0f))
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(ResultOutput))
+						.Font(FCoreStyle::GetDefaultFontStyle("Mono", 8))
+						.ColorAndOpacity(bStepSuccess ? FLinearColor(0.7f, 0.9f, 0.7f, 1.0f) : FLinearColor(0.9f, 0.7f, 0.7f, 1.0f))
+						.AutoWrapText(true)
+					]
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+					.OnClicked_Lambda([QuerySwitcher]() {
+						if (QuerySwitcher.IsValid())
+						{
+							QuerySwitcher->SetActiveWidgetIndex(0);
+						}
+						return FReply::Handled();
+					})
+					[
+						SNew(STextBlock)
+						.Text(NSLOCTEXT("UnrealGPT", "CollapseOutput", "▲ Collapse"))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+						.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+					]
+				]
+			];
+
+			// Add the tool header and expandable query view
+			StepContent->AddSlot()
+				.AutoHeight()
+				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(ToolHeader))
+					.ColorAndOpacity(FSlateColor(ToolColor * 0.8f))
+					.Font(FAppStyle::GetFontStyle("TinyFont"))
+				];
+
+			StepContent->AddSlot()
+				.AutoHeight()
+				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				[
+					QuerySwitcher.ToSharedRef()
+				];
+		}
+		else
+		{
+			// Generic tool display with expandable output
+			FString ResultOutput = Result.ToolResult.RawOutput;
+
+			// Parse arguments for display
+			TArray<FString> ArgParts;
+			for (const auto& Arg : Step.ToolArguments)
+			{
+				FString ArgValue = Arg.Value;
+				// Truncate long values
+				if (ArgValue.Len() > 50)
+				{
+					ArgValue = ArgValue.Left(47) + TEXT("...");
+				}
+				ArgParts.Add(FString::Printf(TEXT("%s=%s"), *Arg.Key, *ArgValue));
+			}
+			FString ArgsDisplay = ArgParts.Num() > 0 ? FString::Join(ArgParts, TEXT(", ")) : TEXT("");
+
+			// Create expand/collapse widget switcher if there's output
+			if (!ResultOutput.IsEmpty())
+			{
+				TSharedPtr<SWidgetSwitcher> ToolSwitcher = SNew(SWidgetSwitcher)
+					.WidgetIndex(0); // Start collapsed
+
+				// Truncate preview of result
+				FString ResultPreview = ResultOutput.Left(100);
+				if (ResultOutput.Len() > 100)
+				{
+					ResultPreview += TEXT("...");
+				}
+
+				// Slot 0: Collapsed state
+				ToolSwitcher->AddSlot()
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(!ArgsDisplay.IsEmpty() ? FString::Printf(TEXT("Args: %s"), *ArgsDisplay) : TEXT("")))
+						.ColorAndOpacity(FSlateColor(ToolColor * 0.7f))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+						.AutoWrapText(true)
+						.Visibility(!ArgsDisplay.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed)
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 2.0f, 0.0f, 0.0f)
+					[
+						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+						.OnClicked_Lambda([ToolSwitcher]() {
+							if (ToolSwitcher.IsValid())
+							{
+								ToolSwitcher->SetActiveWidgetIndex(1);
+							}
+							return FReply::Handled();
+						})
+						[
+							SNew(STextBlock)
+							.Text(NSLOCTEXT("UnrealGPT", "ShowToolOutput", "▼ Show output"))
+							.Font(FAppStyle::GetFontStyle("TinyFont"))
+							.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+						]
+					]
+				];
+
+				// Slot 1: Expanded state
+				ToolSwitcher->AddSlot()
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(!ArgsDisplay.IsEmpty() ? FString::Printf(TEXT("Args: %s"), *ArgsDisplay) : TEXT("")))
+						.ColorAndOpacity(FSlateColor(ToolColor * 0.7f))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+						.AutoWrapText(true)
+						.Visibility(!ArgsDisplay.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed)
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+					[
+						SNew(STextBlock)
+						.Text(NSLOCTEXT("UnrealGPT", "ToolOutput", "Output:"))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+						.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f, 1.0f))
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 2.0f, 0.0f, 0.0f)
+					[
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+						.BorderBackgroundColor(bStepSuccess ? FLinearColor(0.05f, 0.1f, 0.05f, 1.0f) : FLinearColor(0.1f, 0.05f, 0.05f, 1.0f))
+						.Padding(FMargin(6.0f, 4.0f))
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(ResultOutput))
+							.Font(FCoreStyle::GetDefaultFontStyle("Mono", 8))
+							.ColorAndOpacity(bStepSuccess ? FLinearColor(0.7f, 0.9f, 0.7f, 1.0f) : FLinearColor(0.9f, 0.7f, 0.7f, 1.0f))
+							.AutoWrapText(true)
+						]
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+					[
+						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+						.OnClicked_Lambda([ToolSwitcher]() {
+							if (ToolSwitcher.IsValid())
+							{
+								ToolSwitcher->SetActiveWidgetIndex(0);
+							}
+							return FReply::Handled();
+						})
+						[
+							SNew(STextBlock)
+							.Text(NSLOCTEXT("UnrealGPT", "CollapseToolOutput", "▲ Collapse"))
+							.Font(FAppStyle::GetFontStyle("TinyFont"))
+							.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f, 1.0f))
+						]
+					]
+				];
+
+				// Add the tool header and expandable view
+				StepContent->AddSlot()
+					.AutoHeight()
+					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(ToolHeader))
+						.ColorAndOpacity(FSlateColor(ToolColor * 0.8f))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+					];
+
+				StepContent->AddSlot()
+					.AutoHeight()
+					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+					[
+						ToolSwitcher.ToSharedRef()
+					];
+			}
+			else
+			{
+				// No output, just show tool info
+				StepContent->AddSlot()
+					.AutoHeight()
+					.Padding(0.0f, 2.0f, 0.0f, 0.0f)
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(!ArgsDisplay.IsEmpty() ? FString::Printf(TEXT("%s (%s)"), *ToolHeader, *ArgsDisplay) : ToolHeader))
+						.ColorAndOpacity(FSlateColor(ToolColor * 0.7f))
+						.Font(FAppStyle::GetFontStyle("TinyFont"))
+						.AutoWrapText(true)
+					];
+			}
+		}
+	}
+
+	// Create the bordered widget container
+	ChatHistoryBox->AddSlot()
+		.Padding(12.0f, 4.0f)
+		[
+			SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+			.BorderBackgroundColor(ResultColor * 0.15f)
+			.Padding(FMargin(8.0f, 6.0f))
+			[
+				StepContent
+			]
+		];
+
+	ChatHistoryBox->ScrollToEnd();
+}
+
+void SUnrealGPTWidget::HandleAgentNeedUserInput(const FString& Question)
+{
+	if (!ChatHistoryBox.IsValid())
+	{
+		return;
+	}
+
+	// Display the question prominently
+	ChatHistoryBox->AddSlot()
+		.Padding(12.0f, 6.0f)
+		[
+			SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+			.BorderBackgroundColor(FLinearColor(0.3f, 0.3f, 0.1f, 0.8f))
+			.Padding(FMargin(12.0f, 8.0f))
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(STextBlock)
+					.Text(NSLOCTEXT("UnrealGPT", "AgentNeedsInput", "Agent needs your input:"))
+					.Font(FAppStyle::GetFontStyle("SmallFontBold"))
+					.ColorAndOpacity(FLinearColor(1.0f, 0.9f, 0.3f))
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(Question))
+					.ColorAndOpacity(FLinearColor(0.95f, 0.95f, 0.95f))
+					.AutoWrapText(true)
+				]
+			]
+		];
+
+	ChatHistoryBox->ScrollToEnd();
+
+	// Focus the input box so user can type response
+	if (InputTextBox.IsValid())
+	{
+		FSlateApplication::Get().SetKeyboardFocus(InputTextBox, EFocusCause::SetDirectly);
+	}
+}
+
+void SUnrealGPTWidget::HandleAgentProgress(const FString& Message, float Percent)
+{
+	// Update progress bar
+	if (AgentProgressBar.IsValid())
+	{
+		AgentProgressBar->SetVisibility(EVisibility::Visible);
+		AgentProgressBar->SetPercent(Percent / 100.0f);
+	}
+
+	// Update progress text
+	if (AgentProgressText.IsValid())
+	{
+		AgentProgressText->SetText(FText::FromString(
+			FString::Printf(TEXT("%s (%.0f%%)"), *Message, Percent)
+		));
+	}
+}
+
+TSharedRef<SWidget> SUnrealGPTWidget::CreateAgentStateWidget(EAgentState State, const FString& Message)
+{
+	return SNew(SBorder)
+		.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+		.BorderBackgroundColor(GetAgentStateColor(State) * 0.3f)
+		.Padding(FMargin(8.0f, 4.0f))
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(0.0f, 0.0f, 6.0f, 0.0f)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(TEXT("\xf013"))) // Gear icon
+				.Font(FAppStyle::Get().GetFontStyle("FontAwesome.9"))
+				.ColorAndOpacity(FSlateColor(GetAgentStateColor(State)))
+			]
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(Message))
+				.Font(FAppStyle::GetFontStyle("SmallFont"))
+				.ColorAndOpacity(FSlateColor(GetAgentStateColor(State)))
+			]
+		];
+}
+
+FString SUnrealGPTWidget::GetAgentStateDisplayName(EAgentState State) const
+{
+	switch (State)
+	{
+	case EAgentState::Idle:
+		return TEXT("Idle");
+	case EAgentState::ParsingGoal:
+		return TEXT("Parsing Goal...");
+	case EAgentState::Planning:
+		return TEXT("Planning...");
+	case EAgentState::Executing:
+		return TEXT("Executing...");
+	case EAgentState::Evaluating:
+		return TEXT("Evaluating...");
+	case EAgentState::Recovering:
+		return TEXT("Recovering from failure...");
+	case EAgentState::WaitingForUser:
+		return TEXT("Waiting for input...");
+	case EAgentState::Completed:
+		return TEXT("Completed");
+	case EAgentState::Failed:
+		return TEXT("Failed");
+	default:
+		return TEXT("Unknown");
+	}
+}
+
+FLinearColor SUnrealGPTWidget::GetAgentStateColor(EAgentState State) const
+{
+	switch (State)
+	{
+	case EAgentState::Idle:
+		return FLinearColor(0.5f, 0.5f, 0.5f);
+	case EAgentState::ParsingGoal:
+		return FLinearColor(0.3f, 0.7f, 1.0f); // Light blue
+	case EAgentState::Planning:
+		return FLinearColor(0.5f, 0.5f, 1.0f); // Purple-blue
+	case EAgentState::Executing:
+		return FLinearColor(1.0f, 0.8f, 0.2f); // Yellow
+	case EAgentState::Evaluating:
+		return FLinearColor(0.3f, 0.9f, 0.9f); // Cyan
+	case EAgentState::Recovering:
+		return FLinearColor(1.0f, 0.5f, 0.2f); // Orange
+	case EAgentState::WaitingForUser:
+		return FLinearColor(1.0f, 0.9f, 0.3f); // Yellow
+	case EAgentState::Completed:
+		return FLinearColor(0.3f, 1.0f, 0.3f); // Green
+	case EAgentState::Failed:
+		return FLinearColor(1.0f, 0.3f, 0.3f); // Red
+	default:
+		return FLinearColor(0.7f, 0.7f, 0.7f);
+	}
+}
+
+// ==================== AGENT MODE TOGGLE ====================
+
+FReply SUnrealGPTWidget::OnAgentModeToggleClicked()
+{
+	bAgentModeEnabled = !bAgentModeEnabled;
+
+	// Log mode change
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: Switched to %s Mode"),
+		bAgentModeEnabled ? TEXT("Agent") : TEXT("Chat"));
+
+	// Show mode change notification in chat
+	if (ChatHistoryBox.IsValid())
+	{
+		FString ModeMessage = bAgentModeEnabled
+			? TEXT("Switched to Agent Mode - Your requests will be processed as structured goals with verification.")
+			: TEXT("Switched to Chat Mode - Direct LLM conversation with tool calling.");
+
+		FLinearColor ModeColor = bAgentModeEnabled
+			? FLinearColor(0.3f, 0.8f, 0.5f)
+			: FLinearColor(0.5f, 0.6f, 0.8f);
+
+		ChatHistoryBox->AddSlot()
+			.Padding(12.0f, 6.0f)
+			[
+				SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+				.BorderBackgroundColor(ModeColor * 0.3f)
+				.Padding(FMargin(8.0f, 4.0f))
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(ModeMessage))
+					.Font(FAppStyle::GetFontStyle("SmallFont"))
+					.ColorAndOpacity(FSlateColor(ModeColor))
+					.AutoWrapText(true)
+				]
+			];
+
+		ChatHistoryBox->ScrollToEnd();
+	}
+
+	// If switching to agent mode and agent is not idle, reset it
+	if (bAgentModeEnabled && AgentController.IsValid())
+	{
+		if (AgentController->GetState() != EAgentState::Idle)
+		{
+			AgentController->Reset();
+		}
+	}
+
+	return FReply::Handled();
+}
+
+FText SUnrealGPTWidget::GetAgentModeText() const
+{
+	return bAgentModeEnabled
+		? NSLOCTEXT("UnrealGPT", "AgentModeOn", "Agent Mode")
+		: NSLOCTEXT("UnrealGPT", "ChatMode", "Chat Mode");
+}
+
+FText SUnrealGPTWidget::GetAgentModeTooltip() const
+{
+	return bAgentModeEnabled
+		? NSLOCTEXT("UnrealGPT", "AgentModeTooltip",
+			"Agent Mode: Your requests are parsed into goals with explicit success criteria.\n"
+			"The agent plans, executes, and verifies each step programmatically.\n"
+			"Click to switch to Chat Mode.")
+		: NSLOCTEXT("UnrealGPT", "ChatModeTooltip",
+			"Chat Mode: Direct conversation with the LLM.\n"
+			"The LLM decides which tools to call and evaluates success.\n"
+			"Click to switch to Agent Mode.");
+}
+
+FSlateColor SUnrealGPTWidget::GetAgentModeButtonColor() const
+{
+	return bAgentModeEnabled
+		? FSlateColor(FLinearColor(0.3f, 0.9f, 0.5f)) // Green for Agent Mode
+		: FSlateColor(FLinearColor(0.5f, 0.6f, 0.8f)); // Blue-gray for Chat Mode
+}
+
+// ==================== AGENT CANCEL ====================
+
+FReply SUnrealGPTWidget::OnAgentCancelClicked()
+{
+	if (!AgentController.IsValid())
+	{
+		return FReply::Handled();
+	}
+
+	EAgentState CurrentState = AgentController->GetState();
+
+	// Only cancel if agent is actively working
+	if (CurrentState == EAgentState::Idle ||
+		CurrentState == EAgentState::Completed ||
+		CurrentState == EAgentState::Failed)
+	{
+		return FReply::Handled();
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("UnrealGPT: User cancelled agent operation"));
+
+	// Cancel the agent
+	AgentController->Cancel();
+
+	// Also cancel any pending LLM requests
+	FAgentLLMInterface& LLMInterface = AgentController->GetLLMInterface();
+	if (LLMInterface.IsRequestInProgress())
+	{
+		LLMInterface.CancelAsyncRequest();
+	}
+
+	// Show cancellation message in chat
+	if (ChatHistoryBox.IsValid())
+	{
+		ChatHistoryBox->AddSlot()
+			.Padding(12.0f, 6.0f)
+			[
+				SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
+				.BorderBackgroundColor(FLinearColor(0.4f, 0.2f, 0.1f, 0.8f))
+				.Padding(FMargin(12.0f, 8.0f))
+				[
+					SNew(STextBlock)
+					.Text(NSLOCTEXT("UnrealGPT", "AgentCancelled", "Agent operation cancelled by user."))
+					.ColorAndOpacity(FLinearColor(1.0f, 0.6f, 0.3f))
+				]
+			];
+
+		ChatHistoryBox->ScrollToEnd();
+	}
+
+	// Hide progress UI
+	if (AgentProgressBar.IsValid())
+	{
+		AgentProgressBar->SetVisibility(EVisibility::Collapsed);
+	}
+
+	return FReply::Handled();
 }
 

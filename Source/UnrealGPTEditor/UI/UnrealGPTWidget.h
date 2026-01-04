@@ -11,12 +11,18 @@
 #include "Widgets/Views/SListView.h"
 #include "Widgets/Views/STableViewBase.h"
 #include "Widgets/Views/STableRow.h"
+#include "Containers/Ticker.h"
 #include "UnrealGPTAgentClient.h"
 #include "UnrealGPTSessionTypes.h"
+#include "UnrealAgentController.h"
 
 // Forward declarations
 struct FSlateBrush;
 class UTexture2D;
+struct FAgentGoal;
+struct FGoalEvaluation;
+struct FPlanStep;
+struct FStepResult;
 
 class SUnrealGPTWidget : public SCompoundWidget
 {
@@ -25,6 +31,7 @@ public:
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
+	virtual ~SUnrealGPTWidget();
 
 	friend class UUnrealGPTWidgetDelegateHandler;
 
@@ -112,6 +119,35 @@ private:
 	/** Handle tool result delegate - called from agent client */
 	void HandleToolResult(const FString& ToolCallId, const FString& Result);
 
+	// ==================== AGENT CONTROLLER HANDLERS ====================
+
+	/** Handle agent state changes - updates status display */
+	void HandleAgentStateChanged(EAgentState OldState, EAgentState NewState);
+
+	/** Handle goal completion - shows success message */
+	void HandleAgentGoalCompleted(const FAgentGoal& Goal, const FGoalEvaluation& Evaluation);
+
+	/** Handle goal failure - shows failure message */
+	void HandleAgentGoalFailed(const FAgentGoal& Goal, const FString& Reason);
+
+	/** Handle step completion - updates progress display */
+	void HandleAgentStepCompleted(const FPlanStep& Step, const FStepResult& Result);
+
+	/** Handle agent needing user input - prompts user */
+	void HandleAgentNeedUserInput(const FString& Question);
+
+	/** Handle agent progress updates - updates progress bar */
+	void HandleAgentProgress(const FString& Message, float Percent);
+
+	/** Create a widget to display agent state */
+	TSharedRef<SWidget> CreateAgentStateWidget(EAgentState State, const FString& Message);
+
+	/** Get display name for agent state */
+	FString GetAgentStateDisplayName(EAgentState State) const;
+
+	/** Get color for agent state */
+	FLinearColor GetAgentStateColor(EAgentState State) const;
+
 	/** Agent client instance.
 	 *  NOTE: This is a raw pointer in a Slate widget (not a UObject), so UPROPERTY() cannot be used.
 	 *  AddToRoot() is called immediately after NewObject() in Construct() to prevent garbage collection.
@@ -187,5 +223,62 @@ private:
 
 	/** Currently selected session in dropdown */
 	TSharedPtr<FSessionInfo> CurrentSelectedSession;
+
+	// ==================== AGENT CONTROLLER ====================
+
+	/** The true agent controller - orchestrates goal-plan-execute-evaluate cycle.
+	 *  This is a heap-allocated non-UObject, so we manage its lifecycle manually.
+	 */
+	TUniquePtr<FAgentController> AgentController;
+
+	/** Ticker handle for driving the agent state machine */
+	FTSTicker::FDelegateHandle AgentTickerHandle;
+
+	/** Called by the ticker to drive the agent state machine */
+	bool OnAgentTick(float DeltaTime);
+
+	/** Agent status display border */
+	TSharedPtr<class SBorder> AgentStatusBorder;
+
+	/** Agent status text */
+	TSharedPtr<class STextBlock> AgentStatusText;
+
+	/** Agent progress bar */
+	TSharedPtr<class SProgressBar> AgentProgressBar;
+
+	/** Agent progress message */
+	TSharedPtr<class STextBlock> AgentProgressText;
+
+	/** Cancel button for aborting agent operations */
+	TSharedPtr<class SButton> AgentCancelButton;
+
+	/** Handle cancel button click */
+	FReply OnAgentCancelClicked();
+
+	/** Current agent state for display */
+	EAgentState CurrentDisplayedAgentState = EAgentState::Idle;
+
+	// ==================== AGENT MODE ====================
+
+	/** Whether we're in Agent Mode (true) or LLM Chat Mode (false) */
+	bool bAgentModeEnabled = false;
+
+	/** Toggle button for switching between modes */
+	TSharedPtr<class SButton> AgentModeToggleButton;
+
+	/** Text showing current mode */
+	TSharedPtr<class STextBlock> AgentModeText;
+
+	/** Handle agent mode toggle button click */
+	FReply OnAgentModeToggleClicked();
+
+	/** Get the display text for current mode */
+	FText GetAgentModeText() const;
+
+	/** Get the tooltip for the mode toggle */
+	FText GetAgentModeTooltip() const;
+
+	/** Get the button color based on current mode */
+	FSlateColor GetAgentModeButtonColor() const;
 };
 

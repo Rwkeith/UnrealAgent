@@ -15,6 +15,7 @@ public class UnrealGPTEditor : ModuleRules
 			new string[] {
 				ModuleDirectory,
 				System.IO.Path.Combine(ModuleDirectory, "Agent"),
+				System.IO.Path.Combine(ModuleDirectory, "AgentCore"),
 				System.IO.Path.Combine(ModuleDirectory, "Protocol"),
 				System.IO.Path.Combine(ModuleDirectory, "Network"),
 				System.IO.Path.Combine(ModuleDirectory, "Conversation"),
